@@ -190,6 +190,102 @@ NFT_EOF
     fi
 }
 
+# ─── 测试 1b：forward chain 结构验证 ──────────────────────────────────────────
+test_forward_chain_structure() {
+    log_title "测试 1b：forward chain 结构验证"
+
+    # 先清理，重建包含 forward chain 的完整 table
+    nft delete table inet whitelist 2>/dev/null || true
+
+    nft -f - <<'NFT_EOF'
+table inet whitelist {
+    set whitelist4 {
+        type ipv4_addr
+        flags interval
+        auto-merge
+    }
+
+    chain input {
+        type filter hook input priority -10; policy accept;
+        iif "lo" accept
+        ct state established,related accept
+        ct state invalid drop
+        tcp dport 22 accept
+        ip saddr @whitelist4 accept
+        ip6 nexthdr ipv6-icmp accept
+        meta nfproto ipv4 drop
+    }
+
+    chain forward {
+        type filter hook forward priority -10; policy accept;
+        ct state established,related accept
+        ct state invalid drop
+        ip saddr @whitelist4 accept
+        ip saddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } accept
+        ip6 nexthdr ipv6-icmp accept
+        meta nfproto ipv4 drop
+    }
+}
+NFT_EOF
+
+    # 1b.1 forward chain 存在
+    if nft list chain inet whitelist forward &>/dev/null; then
+        log_pass "forward chain 存在"
+    else
+        log_fail "forward chain 不存在"
+        return
+    fi
+
+    # 1b.2 forward chain priority = -10（先捕获再 grep，避免 SIGPIPE + pipefail 陷阱）
+    _FWD_CHAIN=$(nft list chain inet whitelist forward 2>/dev/null)
+    if echo "$_FWD_CHAIN" | grep -qE "priority (filter - 10|-10)"; then
+        log_pass "forward chain priority -10（早于默认 filter(0)）"
+    else
+        log_fail "forward chain priority 不是 -10"
+    fi
+
+    # 1b.3 规则顺序：established 在 invalid drop 之前（先捕获再 grep）
+    LINE_FWD_ESTAB=$(echo "$_FWD_CHAIN" | grep -n "established,related.*accept" | head -1 | cut -d: -f1)
+    LINE_FWD_INV=$(echo "$_FWD_CHAIN" | grep -n "ct state invalid drop" | head -1 | cut -d: -f1)
+    if [[ -n "$LINE_FWD_ESTAB" && -n "$LINE_FWD_INV" && "$LINE_FWD_ESTAB" -lt "$LINE_FWD_INV" ]]; then
+        log_pass "forward 规则顺序：established accept（行 $LINE_FWD_ESTAB）在 invalid drop（行 $LINE_FWD_INV）之前"
+    else
+        log_fail "forward 规则顺序错误：established 行($LINE_FWD_ESTAB) 应在 invalid drop 行($LINE_FWD_INV) 之前"
+    fi
+
+    # 1b.4 规则顺序：私有网段 accept 在最终 ipv4 drop 之前（先捕获再 grep）
+    LINE_FWD_PRIV=$(echo "$_FWD_CHAIN" | grep -n "100\.64\|172\.16\|10\.0\.0\.0\|192\.168" | head -1 | cut -d: -f1)
+    LINE_FWD_DROP=$(echo "$_FWD_CHAIN" | grep -n "meta nfproto ipv4 drop" | head -1 | cut -d: -f1)
+    if [[ -n "$LINE_FWD_PRIV" && -n "$LINE_FWD_DROP" && "$LINE_FWD_PRIV" -lt "$LINE_FWD_DROP" ]]; then
+        log_pass "forward 规则顺序：私有网段 accept（行 $LINE_FWD_PRIV）在 ipv4 drop（行 $LINE_FWD_DROP）之前"
+    else
+        log_fail "forward 规则顺序错误：私有网段 accept 行($LINE_FWD_PRIV) 应在 ipv4 drop 行($LINE_FWD_DROP) 之前"
+    fi
+
+    # 1b.5 drop 在最后（最终 ipv4 drop 应是规则列表最后一条有实质内容的 drop）
+    # 检查 meta nfproto ipv4 drop 存在，且 ipv6-icmp accept 在它之前
+    LINE_FWD_ICMP=$(echo "$_FWD_CHAIN" | grep -n "ipv6-icmp accept" | head -1 | cut -d: -f1)
+    if [[ -n "$LINE_FWD_ICMP" && -n "$LINE_FWD_DROP" && "$LINE_FWD_ICMP" -lt "$LINE_FWD_DROP" ]]; then
+        log_pass "forward 规则顺序：ipv6-icmp accept（行 $LINE_FWD_ICMP）在 meta nfproto ipv4 drop（行 $LINE_FWD_DROP，最后）之前"
+    else
+        log_fail "forward 规则顺序错误：ipv6-icmp 行($LINE_FWD_ICMP) 应在最终 drop 行($LINE_FWD_DROP) 之前"
+    fi
+
+    # 1b.6 私有 set 含四个段（先捕获再 grep，避免 SIGPIPE）
+    # nft 会把匿名 set 展开显示，检查四个段都出现在 forward chain 输出里
+    _FWD_PRIV_10=$(echo "$_FWD_CHAIN" | grep -c "10\.0\.0\.0/8" || true)
+    _FWD_PRIV_172=$(echo "$_FWD_CHAIN" | grep -c "172\.16\.0\.0/12" || true)
+    _FWD_PRIV_192=$(echo "$_FWD_CHAIN" | grep -c "192\.168\.0\.0/16" || true)
+    _FWD_PRIV_CGNAT=$(echo "$_FWD_CHAIN" | grep -c "100\.64\.0\.0/10" || true)
+
+    if [[ "$_FWD_PRIV_10" -ge 1 && "$_FWD_PRIV_172" -ge 1 && \
+          "$_FWD_PRIV_192" -ge 1 && "$_FWD_PRIV_CGNAT" -ge 1 ]]; then
+        log_pass "forward 私有 set 含四个段：10/8, 172.16/12, 192.168/16, 100.64/10（RFC 6598 CGNAT）"
+    else
+        log_fail "forward 私有 set 段不完整（10/8=$_FWD_PRIV_10 172.16/12=$_FWD_PRIV_172 192.168/16=$_FWD_PRIV_192 100.64/10=$_FWD_PRIV_CGNAT，各需>=1）"
+    fi
+}
+
 # ─── 测试 2：set 元素增删验证 ──────────────────────────────────────────────────
 test_set_operations() {
     log_title "测试 2：set 元素增删（模拟 reconcile）"
@@ -565,6 +661,7 @@ main() {
     cleanup
 
     test_rule_structure
+    test_forward_chain_structure
     test_set_operations
     test_connectivity_logic
     test_panic

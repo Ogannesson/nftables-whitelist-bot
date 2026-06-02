@@ -201,10 +201,10 @@ class OfflineGeo:
     def _download_and_cache(self, code: str) -> list[str]:
         """下载 iplist CDN 的 {code}.txt，写缓存，返回 CIDR 列表。"""
         url = f"{IPLIST_BASE_URL}/{code}.txt"
-        proxies = {"all://": self._proxy_url} if self._proxy_url else None
+        proxies = self._proxy_url or None
         try:
             with httpx.Client(
-                proxies=proxies,
+                proxy=proxies,
                 timeout=self._timeout,
                 follow_redirects=True,
             ) as client:
@@ -360,9 +360,9 @@ class OnlineGeo:
         self._timeout = timeout
 
     def _make_client(self) -> httpx.Client:
-        proxies = {"all://": self._proxy_url} if self._proxy_url else None
+        proxies = self._proxy_url or None
         return httpx.Client(
-            proxies=proxies,
+            proxy=proxies,
             timeout=self._timeout,
             follow_redirects=True,
         )

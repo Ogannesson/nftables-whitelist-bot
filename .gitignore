@@ -1,7 +1,5 @@
 # 配置文件（含 token / 密钥，不入库）
 config.toml
-*.toml
-!config.example.toml
 
 # 数据库
 *.db

@@ -6,8 +6,11 @@
 - 省市白名单自动展开为 CIDR（离线库，无需第三方 API）
 - 访问 Telegram 走 SOCKS5 代理
 - 与现有 nftables 规则共存（独立 `table inet whitelist`）
+- **覆盖两条入站路径**：`input`（本机服务）+ `forward`（docker 发布端口、NAT DNAT 转发）
+- 容器/内网主动出网不受影响（私有源 10/8、172.16/12、192.168/16 在 forward chain 放行）
 - SSH 22 永久放行（绝不锁死服务器）
 - 提供 `/panic` 紧急解除一切限制
+- **启用即对所有公网入站生效——务必先填白名单再依赖它**
 
 ## 目录结构
 
@@ -126,11 +129,14 @@ journalctl -u tg-whitelist -f
 ### 7. 验证
 
 ```bash
-# 检查 nftables 规则
+# 检查整个 whitelist table（含 input + forward 两条 chain）
 nft list table inet whitelist
 
-# 检查链规则顺序（iif lo / established,related / tcp 22 必须在 drop 前）
+# 检查 input chain 规则顺序（iif lo / established,related / tcp 22 必须在 drop 前）
 nft list chain inet whitelist input
+
+# 检查 forward chain（docker 发布端口 / NAT DNAT 转发入站的拦截）
+nft list chain inet whitelist forward
 ```
 
 ## 使用说明
@@ -148,9 +154,9 @@ nft list chain inet whitelist input
 
 紧急情况也可直接发送 `/panic` 指令（需二次确认）。
 
-## 防锁死设计
+## 防锁死设计与覆盖范围
 
-nftables chain 规则顺序（严格保证）：
+### chain input（本机直接入站：SSH、本机端口等）
 
 ```
 1. iif "lo" accept                      ← 回环放行
@@ -162,9 +168,24 @@ nftables chain 规则顺序（严格保证）：
 7. meta nfproto ipv4 drop               ← 最后：仅丢弃非白名单 v4
 ```
 
+### chain forward（转发类入站：docker 发布端口、NAT DNAT 转发）
+
+```
+1. ct state established,related accept                               ← 已建连/回程放行（含容器出网）
+2. ct state invalid drop
+3. ip saddr @whitelist4 accept                                       ← 白名单公网源（复用同一个 set）
+4. ip saddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } accept  ← 私有源放行（容器/内网出网）
+5. ip6 nexthdr ipv6-icmp accept
+6. meta nfproto ipv4 drop                                            ← 最后：丢弃公网非白名单转发入站
+```
+
+两条 chain 均挂在同一个 `inet whitelist` 表，优先级 -10（先于 docker filter forward 0），复用同一个 `@whitelist4` set——reconcile 只需更新 set，input 和 forward 同步生效。
+
 - **任何情况下**，SSH 22 均可到达（已建连的 SSH session 也不会被切断）
+- **容器出网不受影响**：私有源（容器/内网）发出的包在 forward chain 规则 4 放行
 - `/panic` 或重启后 Bot 未启动时：table 不存在，现有规则不受影响（fail-open）
 - Bot 重启后自动从 SQLite 恢复防火墙规则
+- **注意**：启用后对所有公网入站立即生效（包括 docker 发布端口）——务必先填好白名单再开启
 
 ### 数据库与防火墙的最终一致性
 

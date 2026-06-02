@@ -22,6 +22,7 @@ from tgwl.firewall import (
     TABLE_NAME,
     SET_NAME,
     CHAIN_NAME,
+    CHAIN_FORWARD_NAME,
     CHAIN_PRIORITY,
 )
 
@@ -92,31 +93,34 @@ class TestEnsureSetup:
         assert len(backend.json_calls) == 1
 
     def test_ensure_setup_json_structure(self, fw: FirewallManager, backend: MockBackend):
-        """验证 JSON 事务包含 table / set / chain + 7 条规则（共 10 个操作）。"""
+        """
+        验证 JSON 事务包含 table / set / 2 chains + 7 input 规则 + 6 forward 规则（共 17 个 add 操作）。
+        table(1) + set(1) + input chain(1) + 7 input rules + forward chain(1) + 6 forward rules = 17
+        """
         backend.raise_on_text(["delete", "table"])
         fw.ensure_setup()
         assert len(backend.json_calls) == 1
         cmd = backend.json_calls[0]
-        # 必须包含 add table、add set、add chain、7 条 add rule
         ops = [list(item.keys())[0] for item in cmd]
-        assert ops.count("add") == 10  # table + set + chain + 7 rules
+        assert ops.count("add") == 17  # table + set + 2 chains + 7 input rules + 6 forward rules
 
     def test_rule_order_enforced(self, fw: FirewallManager, backend: MockBackend):
         """
-        关键测试：验证规则顺序严格为
+        关键测试：验证 input chain 规则顺序严格为
           lo → established,related → invalid → dport 22 → @whitelist4 → ipv6-icmp → nfproto ipv4 drop
         """
         backend.raise_on_text(["delete", "table"])
         fw.ensure_setup()
         cmd = backend.json_calls[0]
 
-        # 提取 rule 操作，按顺序
+        # 提取 input chain 的 rule 操作，按顺序
         rules = [
             item["add"]["rule"]
             for item in cmd
             if "add" in item and "rule" in item["add"]
+            and item["add"]["rule"].get("chain") == CHAIN_NAME
         ]
-        assert len(rules) == 7, f"应有 7 条规则，实际 {len(rules)} 条"
+        assert len(rules) == 7, f"input chain 应有 7 条规则，实际 {len(rules)} 条"
 
         # 规则 0：iif lo accept
         r0_expr = rules[0]["expr"]
@@ -191,7 +195,7 @@ class TestEnsureSetup:
         assert any("drop" in e for e in r6_expr), "规则 6（最后）应 drop"
 
     def test_drop_is_last_rule(self, fw: FirewallManager, backend: MockBackend):
-        """drop 必须是 chain 最后一条规则——绝不能出现在 22/established 之前。"""
+        """input chain 的 drop 必须是最后一条规则——绝不能出现在 22/established 之前。"""
         backend.raise_on_text(["delete", "table"])
         fw.ensure_setup()
         cmd = backend.json_calls[0]
@@ -199,6 +203,7 @@ class TestEnsureSetup:
             item["add"]["rule"]
             for item in cmd
             if "add" in item and "rule" in item["add"]
+            and item["add"]["rule"].get("chain") == CHAIN_NAME
         ]
         # 最后一条必须含 drop
         last_rule_expr = rules[-1]["expr"]
@@ -232,7 +237,7 @@ class TestEnsureSetup:
         )
 
     def test_chain_policy_is_accept(self, fw: FirewallManager, backend: MockBackend):
-        """chain 的 policy 必须是 accept（fail-open）。"""
+        """input 和 forward 两条 chain 的 policy 均必须是 accept（fail-open）。"""
         backend.raise_on_text(["delete", "table"])
         fw.ensure_setup()
         cmd = backend.json_calls[0]
@@ -241,11 +246,14 @@ class TestEnsureSetup:
             for item in cmd
             if "add" in item and "chain" in item["add"]
         ]
-        assert len(chain_items) == 1
-        assert chain_items[0]["policy"] == "accept", "chain policy 必须为 accept（fail-open）"
+        assert len(chain_items) == 2, "应有 input 和 forward 两条 chain"
+        for chain in chain_items:
+            assert chain["policy"] == "accept", (
+                f"chain {chain['name']} policy 必须为 accept（fail-open）"
+            )
 
     def test_chain_priority(self, fw: FirewallManager, backend: MockBackend):
-        """chain 优先级应为 -10（先于默认 filter 0）。"""
+        """input 和 forward 两条 chain 优先级均应为 -10（先于默认 filter 0）。"""
         backend.raise_on_text(["delete", "table"])
         fw.ensure_setup()
         cmd = backend.json_calls[0]
@@ -254,7 +262,182 @@ class TestEnsureSetup:
             for item in cmd
             if "add" in item and "chain" in item["add"]
         ]
-        assert chain_items[0]["prio"] == CHAIN_PRIORITY
+        assert len(chain_items) == 2, "应有 input 和 forward 两条 chain"
+        for chain in chain_items:
+            assert chain["prio"] == CHAIN_PRIORITY, (
+                f"chain {chain['name']} 优先级应为 {CHAIN_PRIORITY}"
+            )
+
+    def test_forward_chain_exists(self, fw: FirewallManager, backend: MockBackend):
+        """ensure_setup 后应有 forward base chain，hook forward，priority -10。"""
+        backend.raise_on_text(["delete", "table"])
+        fw.ensure_setup()
+        cmd = backend.json_calls[0]
+        chain_items = [
+            item["add"]["chain"]
+            for item in cmd
+            if "add" in item and "chain" in item["add"]
+        ]
+        forward_chains = [c for c in chain_items if c["name"] == CHAIN_FORWARD_NAME]
+        assert len(forward_chains) == 1, "应有一条 forward chain"
+        fc = forward_chains[0]
+        assert fc["hook"] == "forward", "forward chain 的 hook 应为 forward"
+        assert fc["prio"] == CHAIN_PRIORITY, f"forward chain 优先级应为 {CHAIN_PRIORITY}"
+        assert fc["type"] == "filter", "forward chain 类型应为 filter"
+        assert fc["policy"] == "accept", "forward chain policy 应为 accept（fail-open）"
+
+    def test_forward_chain_rule_order(self, fw: FirewallManager, backend: MockBackend):
+        """
+        forward chain 规则顺序：
+          established,related → invalid drop → @whitelist4 → 私有网段 accept → ipv6-icmp → ipv4 drop
+        无 iif lo / tcp dport 22（input 专属）。
+        """
+        backend.raise_on_text(["delete", "table"])
+        fw.ensure_setup()
+        cmd = backend.json_calls[0]
+
+        # 提取 forward chain 的规则
+        fwd_rules = [
+            item["add"]["rule"]
+            for item in cmd
+            if "add" in item and "rule" in item["add"]
+            and item["add"]["rule"].get("chain") == CHAIN_FORWARD_NAME
+        ]
+        assert len(fwd_rules) == 6, f"forward chain 应有 6 条规则，实际 {len(fwd_rules)} 条"
+
+        # 规则 0：ct state established,related accept
+        r0_expr = fwd_rules[0]["expr"]
+        assert any(
+            isinstance(e, dict) and "match" in e
+            and "ct" in e["match"].get("left", {})
+            for e in r0_expr
+        ), "forward 规则 0 应匹配 ct state"
+        right_vals = None
+        for e in r0_expr:
+            if isinstance(e, dict) and "match" in e:
+                right_vals = e["match"].get("right", [])
+        assert "established" in right_vals, "forward 规则 0 应含 established"
+        assert "related" in right_vals, "forward 规则 0 应含 related"
+        assert any("accept" in e for e in r0_expr), "forward 规则 0 应 accept"
+
+        # 规则 1：ct state invalid drop
+        r1_expr = fwd_rules[1]["expr"]
+        assert any("drop" in e for e in r1_expr), "forward 规则 1 应 drop（invalid 包）"
+
+        # 规则 2：@whitelist4 accept
+        r2_expr = fwd_rules[2]["expr"]
+        assert any(
+            isinstance(e, dict) and "match" in e
+            and "@whitelist4" in str(e["match"].get("right", ""))
+            for e in r2_expr
+        ), "forward 规则 2 应匹配 @whitelist4"
+        assert any("accept" in e for e in r2_expr), "forward 规则 2 应 accept"
+
+        # 规则 3：私有网段匿名 set accept
+        # 四个段：10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10（CGNAT/Tailscale）
+        r3_expr = fwd_rules[3]["expr"]
+        has_private_set = False
+        for e in r3_expr:
+            if isinstance(e, dict) and "match" in e:
+                right = e["match"].get("right", {})
+                if isinstance(right, dict) and "set" in right:
+                    set_items = right["set"]
+                    if isinstance(set_items, list) and len(set_items) == 4:
+                        addrs = {item["prefix"]["addr"] for item in set_items if "prefix" in item}
+                        if addrs == {"10.0.0.0", "172.16.0.0", "192.168.0.0", "100.64.0.0"}:
+                            has_private_set = True
+        assert has_private_set, (
+            "forward 规则 3 应含私有网段匿名 set（10/8, 172.16/12, 192.168/16, 100.64/10 CGNAT）"
+        )
+        assert any("accept" in e for e in r3_expr), "forward 规则 3 应 accept"
+
+        # 规则 4：ipv6-icmp accept
+        r4_expr = fwd_rules[4]["expr"]
+        has_icmpv6 = any(
+            isinstance(e, dict) and "match" in e
+            and "ipv6-icmp" in str(e["match"].get("right", ""))
+            for e in r4_expr
+        )
+        assert has_icmpv6, "forward 规则 4 应放行 ipv6-icmp"
+
+        # 规则 5：meta nfproto ipv4 drop（最后）
+        r5_expr = fwd_rules[5]["expr"]
+        has_nfproto_ipv4_drop = False
+        for e in r5_expr:
+            if isinstance(e, dict) and "match" in e:
+                left = e["match"].get("left", {})
+                right = e["match"].get("right")
+                if (
+                    isinstance(left, dict)
+                    and left.get("meta", {}).get("key") == "nfproto"
+                    and right == "ipv4"
+                ):
+                    has_nfproto_ipv4_drop = True
+        assert has_nfproto_ipv4_drop, "forward 规则 5 应匹配 meta nfproto ipv4"
+        assert any("drop" in e for e in r5_expr), "forward 规则 5 应 drop"
+
+    def test_forward_chain_no_iif_lo_or_ssh(self, fw: FirewallManager, backend: MockBackend):
+        """forward chain 不应有 iif lo 或 tcp dport 22 规则（那是 input 专属）。"""
+        backend.raise_on_text(["delete", "table"])
+        fw.ensure_setup()
+        cmd = backend.json_calls[0]
+
+        fwd_rules = [
+            item["add"]["rule"]
+            for item in cmd
+            if "add" in item and "rule" in item["add"]
+            and item["add"]["rule"].get("chain") == CHAIN_FORWARD_NAME
+        ]
+        for rule in fwd_rules:
+            for e in rule["expr"]:
+                if not isinstance(e, dict) or "match" not in e:
+                    continue
+                m = e["match"]
+                left = m.get("left", {})
+                right = m.get("right")
+                # 不应有 iif lo
+                assert not (
+                    isinstance(left, dict)
+                    and left.get("meta", {}).get("key") == "iifname"
+                    and right == "lo"
+                ), "forward chain 不应有 iif lo 规则"
+                # 不应有 tcp dport 22
+                assert not (
+                    isinstance(left, dict)
+                    and left.get("payload", {}).get("field") == "dport"
+                    and right == 22
+                ), "forward chain 不应有 tcp dport 22 规则"
+
+    def test_forward_chain_reuses_whitelist4_set(self, fw: FirewallManager, backend: MockBackend):
+        """forward chain 应复用同一个 whitelist4 set，不新建其他 set。"""
+        backend.raise_on_text(["delete", "table"])
+        fw.ensure_setup()
+        cmd = backend.json_calls[0]
+
+        # 只有一个 set 被创建
+        set_items = [
+            item["add"]["set"]
+            for item in cmd
+            if "add" in item and "set" in item["add"]
+        ]
+        assert len(set_items) == 1, "应只创建一个 set（whitelist4），forward chain 复用"
+        assert set_items[0]["name"] == SET_NAME
+
+        # forward chain 中的 whitelist4 引用
+        fwd_rules = [
+            item["add"]["rule"]
+            for item in cmd
+            if "add" in item and "rule" in item["add"]
+            and item["add"]["rule"].get("chain") == CHAIN_FORWARD_NAME
+        ]
+        wl4_refs = []
+        for rule in fwd_rules:
+            for e in rule["expr"]:
+                if isinstance(e, dict) and "match" in e:
+                    right = e["match"].get("right", {})
+                    if isinstance(right, dict) and right.get("set") == f"@{SET_NAME}":
+                        wl4_refs.append(rule)
+        assert len(wl4_refs) == 1, "forward chain 应有且仅有一条 @whitelist4 引用"
 
 
 # --------------------------------------------------------------------------- #

@@ -26,6 +26,7 @@ from tgwl.firewall import (
     TABLE_NAME,
     SET_NAME,
     CHAIN_NAME,
+    CHAIN_FORWARD_NAME,
 )
 
 
@@ -304,15 +305,18 @@ class TestSSHRuleProtocol:
         """
         ct state established,related 必须在 tcp dport 22 之前（索引 1 < 索引 3）。
         回包通过 established 放行，不需要走 SSH 规则。
+        只验证 input chain（SSH 规则仅存在于 input chain）。
         """
         backend.raise_on_text(["delete", "table"])
         fw.ensure_setup()
         cmd = backend.json_calls[0]
 
+        # 只取 input chain 的规则，避免 forward chain 的 established 规则干扰索引
         rules = [
             item["add"]["rule"]
             for item in cmd
             if "add" in item and "rule" in item["add"]
+            and item["add"]["rule"].get("chain") == CHAIN_NAME
         ]
 
         established_index = None

@@ -9,6 +9,7 @@ firewall.py — nftables 抽象层
   - 非 Linux 或无权限时相关调用会抛异常，调用方负责处理
 
 规则结构（每次 ensure_setup 都按此顺序建立）：
+
   chain input {
       type filter hook input priority -10; policy accept;
       iif "lo" accept                          # 1. 回环
@@ -18,6 +19,16 @@ firewall.py — nftables 抽象层
       ip saddr @whitelist4 accept              # 5. 白名单放行
       ip6 nexthdr ipv6-icmp accept             # 6. IPv6 邻居发现
       meta nfproto ipv4 drop                   # 7. 非白名单 v4 丢弃（最后）
+  }
+
+  chain forward {
+      type filter hook forward priority -10; policy accept;
+      ct state established,related accept      # 1. 返回/已建连放行（含容器出网回程）
+      ct state invalid drop                    # 2. 丢弃无效包
+      ip saddr @whitelist4 accept              # 3. 白名单公网源放行（复用同一个 set）
+      ip saddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } accept  # 4. 私有源放行（容器/内网/CGNAT 出网）
+      ip6 nexthdr ipv6-icmp accept             # 5. IPv6 邻居发现
+      meta nfproto ipv4 drop                   # 6. 其余公网非白名单转发入站 drop
   }
 """
 
@@ -56,7 +67,8 @@ _NFT_BIN: str | None = None  # 延迟初始化，首次使用时锁定
 TABLE_FAMILY = "inet"
 TABLE_NAME   = "whitelist"
 SET_NAME     = "whitelist4"
-CHAIN_NAME   = "input"
+CHAIN_NAME         = "input"
+CHAIN_FORWARD_NAME = "forward"
 
 # 链 hook 优先级（-10，在默认 filter 0 之前）
 CHAIN_PRIORITY = -10
@@ -106,7 +118,9 @@ class _LibBackend(_NftBackend):
 
     def run_json(self, cmd_obj: list) -> dict:
         payload = {"nftables": cmd_obj}
-        rc, out, err = self._nft.json_cmd(json.dumps(payload))
+        # 注意：python3-nftables 的 json_cmd 接收 Python dict（内部自行 json.dumps）。
+        # 传 json.dumps(payload) 会导致双重编码 → libnftables 报 "unexpected quoted string"。
+        rc, out, err = self._nft.json_cmd(payload)
         if rc != 0:
             raise RuntimeError(f"nftables json_cmd 失败 (rc={rc}): {err.strip()}")
         return json.loads(out) if out else {}
@@ -545,6 +559,161 @@ class FirewallManager:
                         "family": TABLE_FAMILY,
                         "table": TABLE_NAME,
                         "chain": CHAIN_NAME,
+                        "expr": [
+                            {
+                                "match": {
+                                    "op": "==",
+                                    "left": {"meta": {"key": "nfproto"}},
+                                    "right": "ipv4",
+                                }
+                            },
+                            {"drop": None},
+                        ],
+                    }
+                }
+            },
+
+            # ------------------------------------------------------------------ #
+            # forward chain（拦截 docker 发布端口 + NAT DNAT 转发入站）           #
+            # 注意：forward 无 iif lo / tcp dport 22 ——那是 input 专属            #
+            # ------------------------------------------------------------------ #
+
+            # 创建 chain forward
+            {
+                "add": {
+                    "chain": {
+                        "family": TABLE_FAMILY,
+                        "table": TABLE_NAME,
+                        "name": CHAIN_FORWARD_NAME,
+                        "type": "filter",
+                        "hook": "forward",
+                        "prio": CHAIN_PRIORITY,
+                        "policy": "accept",
+                    }
+                }
+            },
+
+            # forward 规则 1：已建连 / 相关包放行（含容器出网回程）
+            {
+                "add": {
+                    "rule": {
+                        "family": TABLE_FAMILY,
+                        "table": TABLE_NAME,
+                        "chain": CHAIN_FORWARD_NAME,
+                        "expr": [
+                            {
+                                "match": {
+                                    "op": "in",
+                                    "left": {"ct": {"key": "state"}},
+                                    "right": ["established", "related"],
+                                }
+                            },
+                            {"accept": None},
+                        ],
+                    }
+                }
+            },
+
+            # forward 规则 2：无效包丢弃
+            {
+                "add": {
+                    "rule": {
+                        "family": TABLE_FAMILY,
+                        "table": TABLE_NAME,
+                        "chain": CHAIN_FORWARD_NAME,
+                        "expr": [
+                            {
+                                "match": {
+                                    "op": "in",
+                                    "left": {"ct": {"key": "state"}},
+                                    "right": ["invalid"],
+                                }
+                            },
+                            {"drop": None},
+                        ],
+                    }
+                }
+            },
+
+            # forward 规则 3：白名单公网源放行（复用同一个 whitelist4 set）
+            {
+                "add": {
+                    "rule": {
+                        "family": TABLE_FAMILY,
+                        "table": TABLE_NAME,
+                        "chain": CHAIN_FORWARD_NAME,
+                        "expr": [
+                            {
+                                "match": {
+                                    "op": "==",
+                                    "left": {"payload": {"protocol": "ip", "field": "saddr"}},
+                                    "right": {"set": f"@{SET_NAME}"},
+                                }
+                            },
+                            {"accept": None},
+                        ],
+                    }
+                }
+            },
+
+            # forward 规则 4：私有源放行（容器/内网主动发起的出向，防止误伤容器出网）
+            # 使用匿名 set 字面量：{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 }
+            # 100.64.0.0/10 = RFC 6598 CGNAT/共享地址段，覆盖 Tailscale/WireGuard/运营商 CGNAT 的源
+            {
+                "add": {
+                    "rule": {
+                        "family": TABLE_FAMILY,
+                        "table": TABLE_NAME,
+                        "chain": CHAIN_FORWARD_NAME,
+                        "expr": [
+                            {
+                                "match": {
+                                    "op": "==",
+                                    "left": {"payload": {"protocol": "ip", "field": "saddr"}},
+                                    "right": {
+                                        "set": [
+                                            {"prefix": {"addr": "10.0.0.0", "len": 8}},
+                                            {"prefix": {"addr": "172.16.0.0", "len": 12}},
+                                            {"prefix": {"addr": "192.168.0.0", "len": 16}},
+                                            {"prefix": {"addr": "100.64.0.0", "len": 10}},
+                                        ]
+                                    },
+                                }
+                            },
+                            {"accept": None},
+                        ],
+                    }
+                }
+            },
+
+            # forward 规则 5：IPv6 ICMPv6 放行
+            {
+                "add": {
+                    "rule": {
+                        "family": TABLE_FAMILY,
+                        "table": TABLE_NAME,
+                        "chain": CHAIN_FORWARD_NAME,
+                        "expr": [
+                            {
+                                "match": {
+                                    "op": "==",
+                                    "left": {"payload": {"protocol": "ip6", "field": "nexthdr"}},
+                                    "right": "ipv6-icmp",
+                                }
+                            },
+                            {"accept": None},
+                        ],
+                    }
+                }
+            },
+
+            # forward 规则 6：丢弃 v4 非白名单转发入站（最后）
+            {
+                "add": {
+                    "rule": {
+                        "family": TABLE_FAMILY,
+                        "table": TABLE_NAME,
+                        "chain": CHAIN_FORWARD_NAME,
                         "expr": [
                             {
                                 "match": {
