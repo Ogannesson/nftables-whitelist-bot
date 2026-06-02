@@ -184,10 +184,10 @@ class TestReconcileIPv4Address:
         assert len(add_elem_ops) == 1
         elem_list = add_elem_ops[0]["elem"]
         assert len(elem_list) == 1
-        # 元素应为 /32 形式（单主机）
-        net = ipaddress.ip_network(elem_list[0], strict=False)
-        assert net.prefixlen == 32, f"IPv4Address 应转为 /32，实际: {elem_list[0]}"
-        assert str(net.network_address) == "10.0.0.1"
+        # 元素应为 prefix 对象，/32 形式（单主机）
+        assert elem_list[0] == {"prefix": {"addr": "10.0.0.1", "len": 32}}, (
+            f"IPv4Address 应转为 prefix 对象 /32，实际: {elem_list[0]}"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -234,7 +234,10 @@ class TestReconcileAllFiltered:
         # 只有 2 个合法 IPv4 CIDR
         assert len(elems) == 2
         for e in elems:
-            net = ipaddress.ip_network(e, strict=False)
+            assert "prefix" in e, f"元素应为 prefix 对象，实际: {e}"
+            net = ipaddress.ip_network(
+                f"{e['prefix']['addr']}/{e['prefix']['len']}", strict=False
+            )
             assert isinstance(net, ipaddress.IPv4Network)
 
 
@@ -388,10 +391,12 @@ class TestReconcileElementContent:
             if "add" in item and "element" in item["add"]
         ]
         assert len(add_elem_ops) == 1
-        elem_list = set(add_elem_ops[0]["elem"])
-
-        expected = {"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
-        assert elem_list == expected, f"CIDR 不匹配: {elem_list} != {expected}"
+        got = {
+            (e["prefix"]["addr"], e["prefix"]["len"])
+            for e in add_elem_ops[0]["elem"]
+        }
+        expected = {("10.0.0.0", 8), ("172.16.0.0", 12), ("192.168.0.0", 16)}
+        assert got == expected, f"CIDR 不匹配: {got} != {expected}"
 
     def test_reconcile_json_targets_correct_set_name(
         self, fw: FirewallManager, backend: MockBackend

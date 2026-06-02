@@ -190,13 +190,32 @@ class OfflineGeo:
         return self._download_and_cache(code)
 
     def _read_txt(self, path: Path) -> list[str]:
-        """从文件读取 CIDR 列表（每行一个，忽略注释和空行）。"""
-        lines = []
+        """从文件读取 CIDR 列表（每行一个，忽略注释/空行）。
+
+        每行用 ipaddress 严格校验并规范化，跳过非法行——防止下载到错误页/脏数据
+        时把非 CIDR 字符串灌进 nft set（nft 会把它当主机名 DNS 解析，导致整个
+        reconcile 失败：Could not resolve hostname）。
+        """
+        cidrs: list[str] = []
+        skipped = 0
         for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
-            if line and not line.startswith("#"):
-                lines.append(line)
-        return lines
+            if not line or line.startswith("#"):
+                continue
+            try:
+                net = ipaddress.ip_network(line, strict=False)
+            except ValueError:
+                skipped += 1
+                continue
+            if net.version != 4:
+                continue  # whitelist4 set 只收 IPv4
+            cidrs.append(str(net))
+        if skipped:
+            logger.warning(
+                "%s: 跳过 %d 行非法 CIDR（数据源可能异常/下载到错误内容）",
+                path.name, skipped,
+            )
+        return cidrs
 
     def _download_and_cache(self, code: str) -> list[str]:
         """下载 iplist CDN 的 {code}.txt，写缓存，返回 CIDR 列表。"""

@@ -743,19 +743,25 @@ class FirewallManager:
         优先 JSON 事务；subprocess 后端 fallback 到两步操作（同样安全，
         因为 flush 后 drop 期极短且 policy accept 兜底）。
         """
-        # 验证所有元素都是合法 IP/CIDR，防止注入（即使 subprocess 不用 shell）
-        validated = []
+        # 验证所有元素都是合法 IPv4 网段，并转成 nft JSON 的 prefix 对象。
+        # 关键：nft JSON 的 set element 对 CIDR 必须用 {"prefix": {"addr","len"}} 对象，
+        # 不能用 "a.b.c.d/len" 字符串——带 / 的字符串会被 nft 当主机名做 DNS 解析，
+        # 报 "Could not resolve hostname"，导致整个 reconcile 失败。
+        elem_objs = []
         for elem in elements:
             try:
                 net = ipaddress.ip_network(elem, strict=False)
-                if not isinstance(net, ipaddress.IPv4Network):
-                    logger.warning("跳过非 IPv4 元素: %s", elem)
-                    continue
-                validated.append(str(net))
             except ValueError:
                 logger.warning("跳过无效 CIDR: %s", elem)
+                continue
+            if not isinstance(net, ipaddress.IPv4Network):
+                logger.warning("跳过非 IPv4 元素: %s", elem)
+                continue
+            elem_objs.append(
+                {"prefix": {"addr": str(net.network_address), "len": net.prefixlen}}
+            )
 
-        if not validated:
+        if not elem_objs:
             self._flush_set()
             return
 
@@ -777,7 +783,7 @@ class FirewallManager:
                         "family": TABLE_FAMILY,
                         "table": TABLE_NAME,
                         "name": SET_NAME,
-                        "elem": validated,
+                        "elem": elem_objs,
                     }
                 }
             },
