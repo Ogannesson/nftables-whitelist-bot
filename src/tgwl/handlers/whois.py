@@ -34,11 +34,31 @@ async def cb_whois_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """callback_data=whois:prompt，提示用户发送 IP。"""
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text(
+    msg = await query.edit_message_text(
         "请发送要查询归属地的 IPv4 地址：",
         reply_markup=ui.cancel_keyboard(),
     )
+    # 记录 prompt 消息位置，用于收到文本后清除取消按钮
+    if msg:
+        context.user_data["whois_prompt_chat_id"] = msg.chat_id
+        context.user_data["whois_prompt_message_id"] = msg.message_id
     return WAIT_WHOIS_IP
+
+
+async def _clear_whois_prompt_keyboard(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """清除 whois prompt 消息上的 inline 取消按钮（孤儿按钮清理）。"""
+    chat_id = context.user_data.pop("whois_prompt_chat_id", None)
+    message_id = context.user_data.pop("whois_prompt_message_id", None)
+    if chat_id and message_id:
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=None,
+            )
+        except Exception:
+            # 消息已被删除或无法编辑时静默忽略
+            pass
 
 
 async def recv_whois_ip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -69,6 +89,8 @@ async def recv_whois_ip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             f"  城市: {info.city}\n"
             f"  ISP: {info.isp}"
         )
+        # 清除 prompt 消息上残留的取消按钮
+        await _clear_whois_prompt_keyboard(context)
         await update.message.reply_text(
             result_text,
             reply_markup=ui.whois_result_keyboard(text),

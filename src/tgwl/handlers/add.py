@@ -365,10 +365,14 @@ async def cb_add_ip_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     query = update.callback_query
     await query.answer()
     context.user_data["add_mode"] = "ip"
-    await query.edit_message_text(
+    msg = await query.edit_message_text(
         "请发送要添加的 IPv4 地址（如 1.2.3.4）：",
         reply_markup=ui.cancel_keyboard(),
     )
+    # 记录 prompt 消息位置，用于收到文本后清除取消按钮
+    if msg:
+        context.user_data["add_prompt_chat_id"] = msg.chat_id
+        context.user_data["add_prompt_message_id"] = msg.message_id
     return WAIT_IP_TEXT
 
 
@@ -378,11 +382,31 @@ async def cb_add_cidr_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     context.user_data["add_mode"] = "cidr"
-    await query.edit_message_text(
+    msg = await query.edit_message_text(
         "请发送要添加的 IPv4 CIDR 段（如 192.168.0.0/24）：",
         reply_markup=ui.cancel_keyboard(),
     )
+    # 记录 prompt 消息位置，用于收到文本后清除取消按钮
+    if msg:
+        context.user_data["add_prompt_chat_id"] = msg.chat_id
+        context.user_data["add_prompt_message_id"] = msg.message_id
     return WAIT_IP_TEXT
+
+
+async def _clear_prompt_keyboard(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """清除 add_prompt 消息上的 inline 取消按钮（孤儿按钮清理）。"""
+    chat_id = context.user_data.pop("add_prompt_chat_id", None)
+    message_id = context.user_data.pop("add_prompt_message_id", None)
+    if chat_id and message_id:
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=None,
+            )
+        except Exception:
+            # 消息已被删除或无法编辑时静默忽略
+            pass
 
 
 async def recv_ip_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -414,6 +438,9 @@ async def recv_ip_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> st
     etype = entry_type_for_text(parsed)
     if etype is None:
         etype = mode
+
+    # 清除 prompt 消息上残留的取消按钮
+    await _clear_prompt_keyboard(context)
 
     await update.message.reply_text(
         f"将添加以下条目到白名单：\n  类型：{etype}\n  值：{parsed}\n\n确认？",

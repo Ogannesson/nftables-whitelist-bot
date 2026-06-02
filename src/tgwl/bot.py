@@ -20,7 +20,7 @@ import logging
 import sys
 from pathlib import Path
 
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -57,9 +57,19 @@ def setup_logging(level: int = logging.INFO) -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
+async def _post_init(application: Application) -> None:
+    """Bot 初始化完成后注册命令菜单（走已配置的代理）。"""
+    await application.bot.set_my_commands([
+        BotCommand("start", "打开主菜单"),
+        BotCommand("menu", "打开主菜单"),
+        BotCommand("panic", "紧急解除所有白名单限制"),
+    ])
+    logger.info("Bot 命令菜单已注册")
+
+
 def build_application(cfg: Config) -> Application:
     """构建 Telegram Application（带 SOCKS5 代理）。"""
-    builder = ApplicationBuilder().token(cfg.bot.token)
+    builder = ApplicationBuilder().token(cfg.bot.token).post_init(_post_init)
     if cfg.proxy.url:
         builder = builder.proxy(cfg.proxy.url).get_updates_proxy(cfg.proxy.url)
     return builder.build()
