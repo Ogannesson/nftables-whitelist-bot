@@ -1,0 +1,11 @@
+# 运行依赖
+python-telegram-bot[socks]>=22.0
+httpx[socks]>=0.27
+
+# 系统依赖（非 pip，apt 安装）：
+# python3-nftables — nftables Python 绑定，venv 须 --system-site-packages
+
+# 开发 / 测试依赖
+pytest>=8.0
+pytest-asyncio>=0.23
+pytest-mock>=3.14

@@ -1,0 +1,32 @@
+# Telegram 白名单 Bot 配置示例
+# 复制为 config.toml 并填写真实值；chmod 600 config.toml
+
+[bot]
+# Telegram Bot Token（从 @BotFather 获取）
+token = "1234567890:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# 主管理员 Telegram user_id（数字 ID，可从 @userinfobot 获取）
+primary_admin = 123456789
+
+[proxy]
+# SOCKS5 代理地址（Bot 访问 Telegram API 使用）
+# 格式：socks5h://[user:pass@]host:port
+# socks5h 表示 DNS 由代理端解析（推荐，防 DNS 泄漏）
+url = "socks5h://127.0.0.1:1080"
+
+# 若代理需要认证，可在 URL 中包含，或单独填写：
+# username = ""
+# password = ""
+
+[geo]
+# 离线数据目录（存放 iplist cncity/*.txt 和 ip2region xdb）
+# 相对于 config.toml 所在目录，或填绝对路径
+data_dir = "data"
+
+# 在线 IP 归属查询 provider（/whois 正向查询用，不能反查省市 CIDR）
+# 当前仅支持 ip-api（免 key，无需任何 API 凭据，走配置的 SOCKS5 代理）
+online_provider = "ip-api"
+
+[database]
+# SQLite 数据库文件路径（相对或绝对）
+path = "whitelist.db"

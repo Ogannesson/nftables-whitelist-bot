@@ -1,0 +1,59 @@
+[Unit]
+Description=Telegram IP Whitelist Bot (nftables)
+Documentation=https://github.com/your-org/tg-whitelist
+After=network-online.target nftables.service
+Wants=network-online.target
+# 依赖 nftables 已启动，但即使 nftables 未就绪 bot 也可 fail-open 启动
+Requires=
+
+[Service]
+Type=simple
+User=tgwl
+Group=tgwl
+
+# 工作目录（存放 config.toml、whitelist.db、data/）
+WorkingDirectory=/opt/tg-whitelist
+
+# 推荐使用环境变量覆盖凭据（避免 config.toml 权限泄漏风险）
+# EnvironmentFile=/opt/tg-whitelist/.env
+
+ExecStart=/opt/tg-whitelist/.venv/bin/python -m tgwl.bot --config /opt/tg-whitelist/config.toml
+
+# 进程崩溃后自动重启（最多 5 次，每次间隔 10s）
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# -------- 能力配置（非 root 运行 nftables）--------
+# 仅授予操作 nftables 所需的 CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+
+# -------- 安全加固 --------
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+# nftables 需要 AF_NETLINK；SOCKS5 需要 AF_INET
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+
+# 写权限目录白名单（数据库、数据缓存、日志）
+ReadWritePaths=/opt/tg-whitelist
+
+# 限制系统调用集（允许 netlink 相关）
+SystemCallFilter=@system-service @network-io
+SystemCallErrorNumber=EPERM
+
+# 标准输出 / 错误输出接入 journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tg-whitelist
+
+[Install]
+WantedBy=multi-user.target
