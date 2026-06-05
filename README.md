@@ -10,7 +10,7 @@
 - 容器/内网主动出网不受影响（私有源 10/8、172.16/12、192.168/16 在 forward chain 放行）
 - SSH 22 永久放行（绝不锁死服务器）
 - **三态防火墙模式**：正常 / 封城（仅 SSH+established）/ 放行（完全开放）；模式持久化，重启保持
-- **web auth 自动加白**：Cloudflare Worker + Access 触发，bot 定时 pull，访客认证即自动入白名单（🤖 标注）
+- **web auth 自动加白**：Cloudflare Worker + Access，访客认证后网页探测其真实 IPv4 出口、确认提交，bot 定时 pull 自动入白名单（🤖 标注）
 - **归属查询精度提升**：在线优先 IP2Location.io（精确到省市），离线兜底 ip2region xdb，最后 ip-api
 - 提供 `/panic` 临时放行（不持久，重启自动恢复白名单）
 - **启用即对所有公网入站生效——务必先填白名单再依赖它**
@@ -266,13 +266,15 @@ API key 通过 `config.toml`（`chmod 600`）或环境变量传入，不硬编�
 
 ## web auth 自动加白
 
-通过 Cloudflare Workers + Cloudflare Access，访客访问受保护的 URL 完成认证后，边缘侧捕获真实 IP 并写入 KV，Bot 定时 SOCKS5 pull 并自动永久加白。
+通过 Cloudflare Workers + Cloudflare Access 提供一个网页注册入口：访客通过 Access 认证后，**网页用 JavaScript 探测其真实的 IPv4 出口地址**（浏览器 fetch 公共 v4-only API），展示并由用户确认后提交；Worker 校验为合法公网 IPv4 后写入 KV，Bot 定时经 SOCKS5 pull 并自动永久加白。
+
+> **为什么网页探测 v4 而非用 Cloudflare 回传的访问 IP？** nftables 白名单是 IPv4 only，但终端常 IPv6 优先，边缘 `CF-Connecting-IP` 往往是 v6（非企业版无法关闭 IPv6），直接用会写入永远加不进的 v6。代价：IP 改为客户端自报、可伪造，安全依赖 Access policy 只放本人邮箱——详见 [`docs/deploy/web-auth.md`](docs/deploy/web-auth.md) 的「安全模型」。
 
 ### 一键部署 Cloudflare Worker
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Ogannesson/nftables-whitelist-bot/tree/main/cloudflare/worker)
 
-点击按钮，Cloudflare 会 clone 本 Worker 子目录到你的账号、自动创建 KV、配 Workers Builds（CI/CD，后续 push 自动部署）、提示填 4 个 secret：
+点击按钮，Cloudflare 会把本 Worker 子目录 clone 成**你账号下一个独立的新仓库**、自动创建 KV、配 Workers Builds（CI/CD）、提示填 4 个 secret：
 
 | Secret | 说明 |
 |---|---|
@@ -281,7 +283,11 @@ API key 通过 `config.toml`（`chmod 600`）或环境变量传入，不硬编�
 | `PULL_CLIENT_ID` | Service Token Client ID（含 `.access` 后缀） |
 | `PULL_CLIENT_SECRET` | Service Token Client Secret |
 
-部署后仍需在 Cloudflare Zero Trust 创建 Access 应用保护 Worker 的 `GET /`、创建 Service Token，并把 Worker URL + Service Token 填入 bot 的 `config.toml [cf_pull]`。详见 [`docs/deploy/web-auth.md`](docs/deploy/web-auth.md)。
+> ⚠️ **部署后改了代码该往哪推？** 一键部署会创建一个**独立仓库**，Workers Builds 监听的是**那个独立仓库**（默认分支通常是 `master`），不是你 clone 的这个主仓库。所以之后你改 Worker 代码、想让它重新部署，二选一：
+> - **把改动推到那个独立仓库**；或
+> - **改连本主仓库**（推荐 monorepo 维护者）：Worker → **Settings → Build**，Git repository 改成本仓库、Git branch 设 `main`、**Root directory 设 `cloudflare/worker`**；之后直接推主仓库即自动部署。注意此时要确保本仓库 `cloudflare/worker/wrangler.toml` 的 KV `id` 是真实值（独立仓库那份由 Cloudflare 自动填，主仓库这份需手动填一次）。
+
+部署后仍需在 Cloudflare Zero Trust 创建 Access 应用保护 Worker 的 `GET /`、创建 Service Token，并把 Worker URL + Service Token 填入 bot 的 `config.toml [cf_pull]`。
 
 - 服务器无需开放任何入站端口（无 Webhook、无 cloudflared）
 - 加白条目在列表中以 🤖 标注，来源可追溯

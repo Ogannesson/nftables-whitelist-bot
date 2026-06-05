@@ -9,9 +9,11 @@ IP registration gateway. Users visit the protected URL through Cloudflare Access
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Ogannesson/nftables-whitelist-bot/tree/main/cloudflare/worker)
 
 点击按钮后，Cloudflare 会：
-1. 将本 Worker 子目录 clone 到你的账号并启用 Workers Builds（后续 push 自动部署）
+1. 将本 Worker 子目录 clone 成**你账号下一个独立的新仓库**并启用 Workers Builds（push 到该独立仓库自动部署）
 2. 自动创建 KV namespace 并绑定（`WHITELIST_KV`）
 3. 提示填写 4 个 secret：`TEAM_DOMAIN` / `POLICY_AUD` / `PULL_CLIENT_ID` / `PULL_CLIENT_SECRET`（格式参考 `.dev.vars.example`）
+
+> ⚠️ **部署后改代码往哪推**：Workers Builds 监听的是上面那个**独立仓库**（默认分支通常是 `master`），不是这个主仓库。之后改 Worker 代码，要么推到独立仓库，要么在 Worker → **Settings → Build** 把 Git repository 改连主仓库、branch 设 `main`、**Root directory 设 `cloudflare/worker`**（推主仓库即部署；需确保主仓库 `wrangler.toml` 的 KV `id` 为真实值）。
 
 部署完成后仍需手动配置：
 - 在 Cloudflare Zero Trust 创建 Access 应用，保护 Worker 的 `GET /`
