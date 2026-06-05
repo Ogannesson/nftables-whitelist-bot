@@ -14,7 +14,7 @@ workers_dev = true
 # Workers KV namespace — Deploy to Cloudflare 会自动创建并替换此 id
 [[kv_namespaces]]
 binding = "WHITELIST_KV"
-id      = "placeholder"
+id      = "ae9173cbdf3c4fdea100db46a453e9b3"
 # preview_id = "placeholder"  # 可选，供 wrangler dev 使用
 
 # 自定义域路由（可选，手动部署时取消注释并填写）
