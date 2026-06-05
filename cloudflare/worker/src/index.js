@@ -168,7 +168,7 @@ async function handleIndex(request, env) {
     // dual-stack source returning a v6 address is skipped rather than misused.
     function asV4(s) {
       const ip = String(s == null ? '' : s).trim();
-      return /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip) ? ip : null;
+      return /^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$/.test(ip) ? ip : null;
     }
 
     async function detectV4() {
@@ -179,7 +179,7 @@ async function handleIndex(request, env) {
       const sources = [
         async () => {
           const t = await (await fetch('https://my.ip.cn/')).text();
-          const m = t.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/);
+          const m = t.match(/(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})/);
           return m ? m[1] : null;
         },
         async () => {
