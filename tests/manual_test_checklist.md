@@ -512,22 +512,24 @@ ps aux | grep tgwl | grep -v grep
 
 > 前提：已按 `docs/deploy/web-auth.md` 完成 Cloudflare Worker 部署，并在 `config.toml` 的 `[cf_pull]` 中填写正确的 `worker_url`、`access_client_id`、`access_client_secret`，`enabled = true`。
 
-### CF-1 浏览器认证触发加白（完整流程）
+### CF-1 浏览器认证 + 自报 v4 触发加白（完整流程）
 
 **操作**：
 1. 确认 `[cf_pull]` 已启用，`poll_interval_seconds` 建议临时改为 `30` 便于测试
-2. 用尚未加白的浏览器 IP 访问受 Cloudflare Access 保护的 Worker URL
-3. 完成 Access 认证（Google / OTP 等），页面显示成功
-4. 等待最多一个 poll 周期（30 秒）
-5. 在 Telegram 点「查看/管理」检查白名单列表
-6. 服务器执行 `nft list set inet whitelist whitelist4`
+2. 用尚未加白的设备访问受 Cloudflare Access 保护的 Worker URL（`GET /`）
+3. 完成 Access 认证（policy 只放行本人邮箱）
+4. 页面应展示两行：**Cloudflare 看到你**（可能是 IPv6）/ **你的 IPv4 出口**（网页 JS 探测 `api4.ipify.org`）
+5. 核对探测到的 v4 是你的真实出口，点「确认加入白名单」→ 页面显示「已提交成功 + Registration ID」
+6. 等待最多一个 poll 周期（30 秒）
+7. 在 Telegram 点「查看/管理」检查白名单列表
+8. 服务器执行 `nft list set inet whitelist whitelist4`
 
 **期望**：
-- 列表中出现新条目，IP 为浏览器出口 IP，标注 🤖（自动加白）
-- nft set 中包含该 IP
+- 列表中出现新条目，IP 为**网页探测到的 IPv4 出口**（不是 CF 看到的 v6），标注 🤖（自动加白）
+- nft set 中包含该 IPv4
 - bot 日志显示 `cf_pull: pulled N new IP(s)` 或类似提示
 
-**验收**：[ ] 🤖 条目出现，[ ] nft set 生效，[ ] 日志有拉取记录
+**验收**：[ ] 页面正确展示 CF-IP / v4 对比，[ ] 🤖 条目为 v4 出口（非 v6），[ ] nft set 生效，[ ] 日志有拉取记录
 
 ### CF-2 重复 pull 不重复写入
 
@@ -569,6 +571,37 @@ ps aux | grep tgwl | grep -v grep
 - 白名单不受影响
 
 **验收**：[ ] 错误日志明确，[ ] bot 不崩溃，[ ] 不污染白名单
+
+### CF-5 纯 IPv6 网络：页面提示无 v4 出口，不误加白
+
+**操作**：
+1. 用**纯 IPv6**（无 IPv4 出口）的网络设备访问 Worker URL，完成 Access 认证
+2. 观察页面
+
+**期望**：
+- 页面「你的 IPv4 出口」显示「未检测到」，并提示需要 IPv4 网络
+- **不显示**「确认加入白名单」按钮（无法提交）
+- 不会把 CF 看到的 v6 地址写入白名单（v6 永远进不了 whitelist4）
+
+**验收**：[ ] 提示无 v4 出口，[ ] 提交按钮隐藏，[ ] 白名单无 v6 条目
+
+### CF-6 伪造非法/私有 IP 被 `/register` 拒绝（信任模型边界）
+
+**背景**：IP 由客户端自报、可伪造，后端 `isPublicIPv4` 必须拦截非法/私有/保留地址。
+
+**操作**：用**有效 Access 会话**（浏览器开发者工具 Console 或脚本）直接构造 `POST /register`，分别提交：
+- 私有：`{"ip":"192.168.1.1"}`、`{"ip":"10.0.0.1"}`
+- 回环：`{"ip":"127.0.0.1"}`
+- CGNAT：`{"ip":"100.64.0.1"}`
+- 非法格式：`{"ip":"01.02.03.04"}`（前导零）、`{"ip":"999.1.1.1"}`
+- IPv6：`{"ip":"2001:db8::1"}`
+
+**期望**：
+- 每个请求都返回 **400 `Bad Request: invalid or non-public IPv4`**
+- 这些地址都**不会**进入 KV / 白名单
+- 另测：**不带** Access JWT 直接 `POST /register` 应返回 **403**（防绕过页面）
+
+**验收**：[ ] 私有/回环/CGNAT/非法/v6 全部被拒（400），[ ] 无 JWT 被拒（403），[ ] 白名单未被污染
 
 ---
 

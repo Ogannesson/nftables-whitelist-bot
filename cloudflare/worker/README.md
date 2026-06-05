@@ -1,6 +1,8 @@
 # tg-whitelist Cloudflare Worker
 
-IP registration gateway. Users visit the protected URL through Cloudflare Access; the Worker records their real IP into Workers KV. The server-side bot periodically pulls and ACKs.
+IP registration gateway. Users visit the protected URL through Cloudflare Access; the Worker returns an HTML page whose JavaScript detects the client's **real IPv4 egress** via a v4-only public API (`api4.ipify.org`, fallback `ipv4.icanhazip.com`). After the user confirms, the IPv4 is submitted to `POST /register`, validated as a public IPv4, and written to Workers KV. The server-side bot periodically pulls and ACKs.
+
+> Why client-side detection instead of `CF-Connecting-IP`? The nftables allowlist is IPv4-only, but most clients prefer IPv6, so Cloudflare's edge `CF-Connecting-IP` is often an IPv6 address (IPv6 can't be disabled on non-Enterprise plans). The trade-off: the IP becomes client-reported (forgeable) — security relies entirely on the Access policy being scoped to the owner's email only. See `docs/deploy/web-auth.md` → "安全模型".
 
 ## 一键部署
 
@@ -42,6 +44,29 @@ PULL_CLIENT_ID=your-service-token-client-id
 PULL_CLIENT_SECRET=your-service-token-client-secret
 ```
 
+## Unit tests
+
+```bash
+npm test        # vitest — covers isPublicIPv4() boundary cases
+```
+
+## Local verification notes
+
+- `GET /` and `POST /register` require a valid Cloudflare **Access JWT**
+  (`Cf-Access-Jwt-Assertion`). Under plain `wrangler dev` there is no such
+  header, so they return **403** — this is expected. End-to-end testing of the
+  detection page must be done in a browser through the Access-protected domain.
+- `POST /pull` and `POST /ack` only need the Service Token headers, so they can
+  be tested locally with `.dev.vars` set:
+
+  ```bash
+  curl -X POST http://localhost:8787/pull \
+    -H "CF-Access-Client-Id: $PULL_CLIENT_ID" \
+    -H "CF-Access-Client-Secret: $PULL_CLIENT_SECRET"
+  ```
+- The IPv4 validation logic (`isPublicIPv4`) is covered by `npm test` and does
+  not require a running Worker.
+
 ## Deploy
 
 See `docs/deploy/web-auth.md` in the repository root for the complete step-by-step deployment guide, including:
@@ -54,15 +79,16 @@ See `docs/deploy/web-auth.md` in the repository root for the complete step-by-st
 
 ## Routes summary
 
-| Method | Path    | Auth                           | Action                          |
-|--------|---------|--------------------------------|---------------------------------|
-| GET    | /       | Cloudflare Access (JWT)        | Register caller's IP into KV    |
-| POST   | /pull   | Service Token (header)         | Return all `pending:*` entries  |
-| POST   | /ack    | Service Token (header)         | Delete `pending:<id>` by id list|
+| Method | Path        | Auth                    | Action                                                  |
+|--------|-------------|-------------------------|---------------------------------------------------------|
+| GET    | /           | Cloudflare Access (JWT) | Return HTML page; JS detects client IPv4 (**no KV write**) |
+| POST   | /register   | Cloudflare Access (JWT) | Validate client-reported IPv4, write `pending`+`audit` KV |
+| POST   | /pull       | Service Token (header)  | Return all `pending:*` entries as `{id,ip,email}`       |
+| POST   | /ack        | Service Token (header)  | Delete `pending:<id>` by id list                        |
 
 ## KV key scheme
 
 | Key pattern       | TTL      | Purpose                         |
 |-------------------|----------|---------------------------------|
 | `pending:<uuid>`  | 86400s   | Awaiting server pull            |
-| `audit:<uuid>`    | none     | Permanent audit trail           |
+| `audit:<uuid>`    | none     | Permanent audit trail (incl. `cfIp` + `email`) |
