@@ -27,6 +27,42 @@ data_dir = "data"
 # 当前仅支持 ip-api（免 key，无需任何 API 凭据，走配置的 SOCKS5 代理）
 online_provider = "ip-api"
 
+# IP2Location.io API Key（可选，免费额度 50,000 次/月）
+# 注册：https://www.ip2location.io/
+# 留空则跳过 IP2Location.io，降级至下一个 provider
+# 也可通过环境变量 TGWL_IP2LOCATION_IO_KEY 注入（优先级更高）
+# ip2location_io_key = ""
+
+# ip2region 离线 xdb 文件路径（可选，用于本地精度优化）
+# 可通过 scripts/fetch_geo.py --ip2region-xdb 下载
+# 留空则跳过离线 xdb，仅使用在线 provider
+# 也可通过环境变量 TGWL_IP2REGION_XDB 注入（优先级更高）
+# ip2region_xdb = "data/ip2region.xdb"
+
 [database]
 # SQLite 数据库文件路径（相对或绝对）
 path = "whitelist.db"
+
+[cf_pull]
+# CF Worker 自动加白 —— 服务器侧定时 pull
+# 由部署在 Cloudflare Workers 的中转服务推送待加白 IP，
+# Bot 按 poll_interval_seconds 轮询并将结果写入 nftables 白名单。
+#
+# 凭据为 Cloudflare Access Service Token：
+#   https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/
+# 出站请求走 [proxy] 中配置的 SOCKS5 代理。
+
+# 是否启用定时拉取（默认关闭）
+enabled = false
+
+# CF Worker 端点 URL（例：https://wl-pull.example.workers.dev）
+worker_url = ""
+
+# Cloudflare Access Service Token Client ID（CF-Access-Client-Id 请求头）
+access_client_id = ""
+
+# Cloudflare Access Service Token Client Secret（CF-Access-Client-Secret 请求头）
+access_client_secret = ""
+
+# 轮询间隔（秒），默认 300 秒 / 5 分钟
+poll_interval_seconds = 300

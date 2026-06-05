@@ -145,8 +145,12 @@ async def cb_mgr_noop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     store, _, _ = _services(context)
     entry = store.get_entry(entry_id)
     if entry:
+        if entry.added_by == 0:
+            source_line = "来源：自动加白(Cloudflare Access)"
+        else:
+            source_line = f"来源：管理员 {entry.added_by}"
         await query.answer(
-            f"类型: {entry.type}\n值: {entry.value}\n标签: {entry.label}",
+            f"类型: {entry.type}\n值: {entry.value}\n标签: {entry.label}\n{source_line}",
             show_alert=True,
         )
     else:

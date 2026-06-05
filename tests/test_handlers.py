@@ -208,7 +208,7 @@ class TestCallbackDataFormats:
         assert "mgr:list:all:0" in all_data
         assert "whois:prompt" in all_data
         assert "status:main" in all_data
-        assert "panic:confirm" in all_data
+        assert "mode:panel" in all_data
         # 非主管理员不含 admin:list
         assert "admin:list" not in all_data
 
@@ -312,3 +312,104 @@ class TestCallbackDataFormats:
         assert "admin:rm_confirm:1002" in all_data
         # 主管理员不应有撤销按钮
         assert "admin:rm_confirm:1001" not in all_data
+
+
+# --------------------------------------------------------------------------- #
+# entry_list_keyboard 自动加白标记测试                                            #
+# --------------------------------------------------------------------------- #
+
+class TestEntryListKeyboardAutoLabel:
+    """验证 added_by==0 的条目在 entry_list_keyboard 中带 🤖 标记。"""
+
+    def _make_entry(self, entry_id: int, label: str, added_by: int) -> MagicMock:
+        entry = MagicMock()
+        entry.id = entry_id
+        entry.label = label
+        entry.value = f"1.2.3.{entry_id}"
+        entry.added_by = added_by
+        return entry
+
+    def test_auto_entry_has_robot_prefix(self):
+        from tgwl import ui
+        auto_entry = self._make_entry(1, "CF-Access:user@example.com", added_by=0)
+        keyboard = ui.entry_list_keyboard([auto_entry], "ip", 0, 1)
+        # 第一行第一个按钮是条目名称按钮
+        btn_text = keyboard.inline_keyboard[0][0].text
+        assert btn_text.startswith("🤖 "), f"期望以 '🤖 ' 开头，实际: {btn_text!r}"
+        assert "CF-Access:user@example.com" in btn_text
+
+    def test_manual_entry_has_no_robot_prefix(self):
+        from tgwl import ui
+        manual_entry = self._make_entry(2, "手动加白", added_by=10001)
+        keyboard = ui.entry_list_keyboard([manual_entry], "ip", 0, 1)
+        btn_text = keyboard.inline_keyboard[0][0].text
+        assert not btn_text.startswith("🤖 "), f"手动条目不应有 🤖 前缀，实际: {btn_text!r}"
+        assert btn_text == "手动加白"
+
+    def test_mixed_entries_prefix_differs(self):
+        from tgwl import ui
+        auto_entry   = self._make_entry(1, "自动条目", added_by=0)
+        manual_entry = self._make_entry(2, "手动条目", added_by=99)
+        keyboard = ui.entry_list_keyboard([auto_entry, manual_entry], "ip", 0, 2)
+        text_auto   = keyboard.inline_keyboard[0][0].text
+        text_manual = keyboard.inline_keyboard[1][0].text
+        assert text_auto.startswith("🤖 ")
+        assert not text_manual.startswith("🤖 ")
+
+    def test_entry_with_no_label_uses_value(self):
+        """label 为空时应回退到 value，同样带 🤖 前缀。"""
+        from tgwl import ui
+        entry = self._make_entry(3, "", added_by=0)
+        entry.label = None
+        keyboard = ui.entry_list_keyboard([entry], "ip", 0, 1)
+        btn_text = keyboard.inline_keyboard[0][0].text
+        assert btn_text.startswith("🤖 ")
+        assert "1.2.3.3" in btn_text  # value fallback
+
+
+# --------------------------------------------------------------------------- #
+# _do_reconcile lockdown 绕过修复（Fix 1）                                       #
+# --------------------------------------------------------------------------- #
+
+class TestDoReconcileLockdown:
+    """验证 _do_reconcile 在 lockdown 模式下拒绝执行（Fix 1 BLOCKING fix）。"""
+
+    @pytest.mark.asyncio
+    async def test_lockdown_mode_raises_runtime_error(self, store: Store):
+        """firewall_ok=True 但模式为 lockdown 时，_do_reconcile 应抛 RuntimeError。"""
+        from tgwl.handlers.add import _do_reconcile
+        from unittest.mock import MagicMock
+
+        # 设置 lockdown 模式（持久化到 store）
+        store.set_setting("firewall_mode", "lockdown")
+
+        # 构造 context，firewall_ok=True（模拟 lockdown 下防火墙已就绪）
+        context = make_context(store)
+        context.bot_data["firewall_ok"] = True
+
+        fw = MagicMock()
+        geo = MagicMock()
+
+        with pytest.raises(RuntimeError, match="lockdown"):
+            await _do_reconcile(store, fw, geo, context)
+
+    @pytest.mark.asyncio
+    async def test_normal_mode_does_not_raise(self, store: Store):
+        """正常模式下 _do_reconcile 不应因 lockdown 检查抛异常。"""
+        from tgwl.handlers.add import _do_reconcile
+        from unittest.mock import MagicMock
+
+        store.set_setting("firewall_mode", "normal")
+
+        context = make_context(store)
+        context.bot_data["firewall_ok"] = True
+
+        fw = MagicMock()
+        fw.reconcile.return_value = None
+        geo = MagicMock()
+
+        # reconcile_from_store 会调用 fw，此处不验返回值，只验不抛 lockdown 异常
+        try:
+            await _do_reconcile(store, fw, geo, context)
+        except RuntimeError as e:
+            assert "lockdown" not in str(e), f"意外的 lockdown 错误: {e}"

@@ -25,6 +25,9 @@ ui.py — InlineKeyboard 构建与 callback_data 路由前缀
   status:sync          — 同步省市数据
   panic:confirm        — Panic 二次确认
   panic:do             — 执行 panic
+  mode:panel           — 防火墙模式面板
+  mode:set:{mode}      — 切换到目标模式（二次确认页）
+  mode:do:{mode}       — 执行模式切换（normal/lockdown/open）
 """
 
 from __future__ import annotations
@@ -55,7 +58,7 @@ def main_menu(is_primary_admin: bool = False) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("管理员管理", callback_data="admin:list")]
         )
     buttons.append(
-        [InlineKeyboardButton("紧急解除（Panic）", callback_data="panic:confirm")]
+        [InlineKeyboardButton("防火墙模式", callback_data="mode:panel")]
     )
     return InlineKeyboardMarkup(buttons)
 
@@ -203,9 +206,11 @@ def entry_list_keyboard(
     """
     rows: list[list[InlineKeyboardButton]] = []
     for entry in entries:
+        base_label = entry.label or entry.value
+        display_label = f"🤖 {base_label}" if entry.added_by == 0 else base_label
         rows.append([
             InlineKeyboardButton(
-                f"{entry.label or entry.value}",
+                display_label,
                 callback_data=f"mgr:noop:{entry.id}",
             ),
             InlineKeyboardButton(
@@ -317,6 +322,37 @@ def panic_confirm_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("确认解除所有限制", callback_data="panic:do"),
             InlineKeyboardButton("取消", callback_data="menu:main"),
+        ]
+    ])
+
+
+# --------------------------------------------------------------------------- #
+# 防火墙模式                                                                    #
+# --------------------------------------------------------------------------- #
+
+_MODE_LABELS: dict[str, str] = {
+    "normal":   "正常（白名单）",
+    "lockdown": "封锁（Lockdown）",
+    "open":     "放行（完全开放）",
+}
+
+
+def firewall_mode_panel_keyboard(current_mode: str) -> InlineKeyboardMarkup:
+    """三态防火墙模式面板。当前模式按钮前加「✓ 」标记。"""
+    rows: list[list[InlineKeyboardButton]] = []
+    for mode, label in _MODE_LABELS.items():
+        display = f"✓ {label}" if mode == current_mode else label
+        rows.append([InlineKeyboardButton(display, callback_data=f"mode:set:{mode}")])
+    rows.append([InlineKeyboardButton("返回主菜单", callback_data="menu:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def mode_confirm_keyboard(mode: str) -> InlineKeyboardMarkup:
+    """模式切换二次确认：确认执行 + 取消返回面板。"""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("确认切换", callback_data=f"mode:do:{mode}"),
+            InlineKeyboardButton("取消", callback_data="mode:panel"),
         ]
     ])
 

@@ -222,3 +222,27 @@ class TestEntries:
         assert entry is not None
         # added_at 应带时区信息
         assert entry.added_at.tzinfo is not None
+
+
+# --------------------------------------------------------------------------- #
+# 设置测试                                                                      #
+# --------------------------------------------------------------------------- #
+
+class TestSettings:
+    def test_set_and_get_setting(self, store: Store):
+        store.set_setting("foo", "bar")
+        assert store.get_setting("foo") == "bar"
+
+    def test_get_setting_not_exist_returns_none(self, store: Store):
+        assert store.get_setting("nonexistent_key") is None
+
+    def test_set_setting_overwrite(self, store: Store):
+        store.set_setting("key1", "value1")
+        store.set_setting("key1", "value2")
+        assert store.get_setting("key1") == "value2"
+
+    def test_set_multiple_settings_independent(self, store: Store):
+        store.set_setting("a", "alpha")
+        store.set_setting("b", "beta")
+        assert store.get_setting("a") == "alpha"
+        assert store.get_setting("b") == "beta"

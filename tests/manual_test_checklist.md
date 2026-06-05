@@ -359,6 +359,219 @@ ps aux | grep tgwl | grep -v grep
 
 ---
 
+## 第十一部分：三态防火墙切换验收
+
+> 前提：已有白名单条目（至少含一个公网 IP/CIDR），且有一个非 SSH 的开放测试端口（如 8080）可供验证被拒绝行为。
+
+### FW-1 normal → lockdown：公网入站被封，SSH / 已建连不受影响
+
+**操作**：
+1. 确认当前模式为 normal（`nft list chain inet whitelist input` 能看到 `@whitelist4` accept 规则）
+2. 点主菜单「防火墙模式」→「封城模式（lockdown）」→ 二次确认
+3. 立即在**已有** SSH session 中执行 `echo ok`（测已建连不断）
+4. 从**另一台机器**尝试连接测试端口（如 `nc -zv <server_ip> 8080`）
+5. 从另一台机器尝试 SSH（`ssh ...`，**新连接**）
+
+**期望**：
+- bot 回复切换成功
+- 已建 SSH session 不中断（步骤 3 正常返回）
+- 步骤 4 新连接被拒（Connection refused 或 timeout）
+- 步骤 5 新 SSH 连接也被拒（端口 22 同样受 lockdown 限制，除非已在 SSH 白名单）
+- `nft list set inet whitelist whitelist4` 输出为空（set 已 flush）
+- 数据库中原白名单条目仍存在（`sqlite3 whitelist.db "SELECT count(*) FROM whitelist_entries"`）
+
+**验收**：[ ] 已建连不断，[ ] 新公网入站被拒，[ ] nft set 为空，[ ] DB 条目保留
+
+### FW-2 lockdown → open：table 整个删除
+
+**操作**：
+1. 当前处于 lockdown 模式
+2. 点「防火墙模式」→「放行模式（open）」→ 二次确认
+3. 执行 `nft list tables`
+4. 从另一台机器测试连接任意端口
+
+**期望**：
+- bot 回复切换成功
+- `nft list tables` 看不到 `inet whitelist`（table 已删除）
+- 所有入站端口均可连接（防火墙完全开放）
+
+**验收**：[ ] table 已删除，[ ] 连通性完全恢复
+
+### FW-3 open → normal：白名单自动恢复
+
+**操作**：
+1. 当前处于 open 模式
+2. 点「防火墙模式」→「正常模式（normal）」→ 二次确认
+3. 执行 `nft list set inet whitelist whitelist4`
+
+**期望**：
+- bot 回复切换成功，并提示已恢复 N 条规则
+- nft set 中重新出现原白名单条目（从 DB 重建）
+- 公网入站再次受白名单控制
+
+**验收**：[ ] set 条目恢复，[ ] 防火墙重新生效
+
+### FW-4 重启持久性验证
+
+**操作**：
+1. 将模式切换到 lockdown，确认 bot 回复成功
+2. 执行 `systemctl restart tg-whitelist`
+3. 重启后检查 nftables 状态
+
+**期望**：
+- 重启后仍处于 lockdown 状态（nft set 为空，chain 保留 SSH/lo/established 规则）
+- Bot 日志显示「从持久状态恢复：lockdown」或类似提示
+
+**验收**：[ ] 重启后持久 lockdown，[ ] 非 normal 规则自动重建
+
+### FW-5 /panic 临时放行（不持久）
+
+**操作**：
+1. 确认当前模式为 normal（或 lockdown）
+2. 发送 `/panic` → 二次确认
+3. 验证 `nft list tables` 看不到 `inet whitelist`
+4. 执行 `systemctl restart tg-whitelist`
+5. 重启后再次检查 nftables 状态
+
+**期望**：
+- `/panic` 后 table 立即删除（同 open 效果）
+- 重启后自动恢复到 `/panic` 之前的持久模式（如 normal），nft set 含原白名单
+- `/panic` 不更改持久化模式记录
+
+**验收**：[ ] panic 立即放行，[ ] 重启后恢复持久模式，[ ] DB 条目未丢失
+
+---
+
+## 第十二部分：归属查询精度验收
+
+> 前提：准备两种测试状态——（A）`config.toml` 中 `ip2location_io_key` 已填写有效 key；（B）key 置空或注释掉。
+
+### GEO-1 IP2Location.io 在线查询（国内 IP）
+
+**操作**：
+1. 确认 `ip2location_io_key` 已配置（状态 A）
+2. 点「查询 IP 归属」，发送一个中国大陆 IP（如 `114.114.114.114`）
+
+**期望**：
+- 返回结果来源标注 IP2Location.io（或精确到省市 ISP）
+- 省市信息中文显示，精度优于 ip-api
+
+**验收**：[ ] 省市信息准确，[ ] 标注 provider 为 ip2location_io
+
+### GEO-2 IP2Location.io 在线查询（境外 IP）
+
+**操作**：发送 `8.8.8.8`（Google DNS，美国）
+
+**期望**：
+- 返回「美国」+ 具体地区/ASN
+- 同样来源标注 IP2Location.io
+
+**验收**：[ ] 境外归属正确，[ ] provider 标注一致
+
+### GEO-3 key 不可用时回落至 ip2region xdb
+
+**操作**：
+1. 将 `ip2location_io_key` 注释掉（状态 B），确认 `ip2region_xdb` 路径已配置且文件存在
+2. 重启 bot（`systemctl restart tg-whitelist`）
+3. 查询同一国内 IP
+
+**期望**：
+- 返回结果来自 ip2region 离线库（可在返回消息或日志中确认 provider）
+- 不因 key 缺失崩溃，不请求 ip2location.io
+
+**验收**：[ ] 离线 xdb 生效，[ ] 无报错
+
+### GEO-4 xdb 也不可用时回落至 ip-api
+
+**操作**：
+1. 注释 `ip2location_io_key` 和 `ip2region_xdb`（两者均不配置）
+2. 重启 bot
+3. 查询国内 IP
+
+**期望**：
+- 返回结果来自 ip-api.com（最终兜底）
+- 功能正常，不崩溃
+
+**验收**：[ ] ip-api 兜底生效，[ ] 响应正常
+
+### GEO-5 全部 provider 不可用时的提示
+
+**操作**：
+1. 注释所有 geo provider，且断开 SOCKS5 代理（使 ip-api 也不可达）
+2. 查询任意 IP
+
+**期望**：
+- bot 返回友好提示（如「归属查询暂不可用」）
+- 不崩溃，不返回空白消息
+
+**验收**：[ ] 友好提示，[ ] 不崩溃
+
+---
+
+## 第十三部分：web auth 自动加白验收
+
+> 前提：已按 `docs/deploy/web-auth.md` 完成 Cloudflare Worker 部署，并在 `config.toml` 的 `[cf_pull]` 中填写正确的 `worker_url`、`access_client_id`、`access_client_secret`，`enabled = true`。
+
+### CF-1 浏览器认证触发加白（完整流程）
+
+**操作**：
+1. 确认 `[cf_pull]` 已启用，`poll_interval_seconds` 建议临时改为 `30` 便于测试
+2. 用尚未加白的浏览器 IP 访问受 Cloudflare Access 保护的 Worker URL
+3. 完成 Access 认证（Google / OTP 等），页面显示成功
+4. 等待最多一个 poll 周期（30 秒）
+5. 在 Telegram 点「查看/管理」检查白名单列表
+6. 服务器执行 `nft list set inet whitelist whitelist4`
+
+**期望**：
+- 列表中出现新条目，IP 为浏览器出口 IP，标注 🤖（自动加白）
+- nft set 中包含该 IP
+- bot 日志显示 `cf_pull: pulled N new IP(s)` 或类似提示
+
+**验收**：[ ] 🤖 条目出现，[ ] nft set 生效，[ ] 日志有拉取记录
+
+### CF-2 重复 pull 不重复写入
+
+**操作**：
+1. 等待再过至少两个 poll 周期
+2. 检查白名单列表中该 IP 的条目数量
+
+**期望**：
+- 同一 IP 不会被重复写入，列表中只出现一次
+- 日志显示「已存在，跳过」或 pull 幂等行为
+
+**验收**：[ ] 无重复条目
+
+### CF-3 封城模式下 pull 只写 DB 不解除封城
+
+**操作**：
+1. 切换到 lockdown 模式（确认 nft set 为空）
+2. 用新 IP 访问 Worker 完成认证，等待 poll
+3. 检查 bot 日志和白名单列表
+4. 检查 nftables set
+
+**期望**：
+- DB 中出现新的 🤖 条目（pull 写入成功）
+- nft set 仍为空（封城未解除）
+- bot 日志提示「当前 lockdown 模式，IP 已入库但未更新 nft」或类似
+
+**验收**：[ ] DB 有新条目，[ ] nft set 仍为空，[ ] 封城状态未变
+
+### CF-4 Service Token 认证失败的错误处理
+
+**操作**：
+1. 临时将 `access_client_secret` 改为错误值
+2. 等待一个 poll 周期
+3. 检查 bot 日志
+
+**期望**：
+- 日志显示认证失败（401/403）错误
+- Bot 不崩溃，继续运行
+- 白名单不受影响
+
+**验收**：[ ] 错误日志明确，[ ] bot 不崩溃，[ ] 不污染白名单
+
+---
+
 ## 附：服务器端快速验证命令
 
 ```bash

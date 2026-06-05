@@ -7,7 +7,7 @@ geo.py — 地理 IP 能力
    - 兜底路径：读 ip2region ipv4_source.txt，按省/市过滤，转 CIDR
 
 2. 在线正向查询：IP → 省市/ISP（不支持反查）
-   - provider：ip-api.com（免 key，无需配置任何 API key）
+   - 级联顺序：IP2LocationIoGeo（在线主源，需 key）→ XdbGeo（离线 xdb，不需 key）→ OnlineGeo（ip-api，免 key）
    - 所有 HTTP 请求走配置的 SOCKS5 代理（httpx）
 
 行政区划码：6 位数字，省级 xx0000，市级 xxxxxx
@@ -343,6 +343,7 @@ class IpInfo:
     province: str = ""
     city: str = ""
     isp: str = ""
+    adcode: str = ""
     raw: dict = None  # type: ignore[assignment]
 
     def __post_init__(self):
@@ -415,6 +416,169 @@ class OnlineGeo:
 
 
 # --------------------------------------------------------------------------- #
+# IP2LocationIoGeo — 在线主源（ip2location.io）                                #
+# --------------------------------------------------------------------------- #
+
+class IP2LocationIoGeo:
+    """
+    ip2location.io 在线查询（需要 API key）。
+    GET https://api.ip2location.io/?key=<key>&ip=<ip>
+    返回 JSON 字段：country_name, region_name, city_name, isp 等。
+    """
+
+    def __init__(
+        self,
+        key: str,
+        proxy_url: str = "",
+        timeout: float = 10.0,
+    ) -> None:
+        if not key:
+            raise ValueError("IP2LocationIoGeo: API key 不能为空")
+        self._key = key
+        self._proxy_url = proxy_url
+        self._timeout = timeout
+
+    def _make_client(self) -> httpx.Client:
+        proxies = self._proxy_url or None
+        return httpx.Client(
+            proxy=proxies,
+            timeout=self._timeout,
+            follow_redirects=True,
+        )
+
+    def lookup(self, ip: str) -> IpInfo:
+        """查询 IP 归属地。失败时抛出异常。"""
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError as e:
+            raise ValueError(f"无效 IP 地址: {ip!r}") from e
+
+        # 修复 #1: 用 params= 传参，key 不拼进 URL 字符串，避免 key 出现在
+        #           httpx 异常消息（含 request.url）中而泄漏进日志。
+        # 修复 #2: 捕获 HTTP/网络错误，重写异常消息为不含 URL/key 的版本，
+        #           阻止原始异常外泄。
+        try:
+            with self._make_client() as client:
+                resp = client.get(
+                    "https://api.ip2location.io/",
+                    params={"key": self._key, "ip": ip},
+                )
+                resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(
+                f"IP2Location.io 请求失败: HTTP {e.response.status_code}"
+            ) from None
+        except httpx.RequestError as e:
+            raise RuntimeError(
+                f"IP2Location.io 网络错误: {type(e).__name__}"
+            ) from None
+
+        data = resp.json()
+        # ip2location.io 在出错时返回 {"error": {"error_code": ..., "error_message": ...}}
+        if "error" in data:
+            raise RuntimeError(f"ip2location.io 查询失败: {data['error']}")
+        return IpInfo(
+            ip=ip,
+            country=data.get("country_name", ""),
+            province=data.get("region_name", ""),
+            city=data.get("city_name", ""),
+            isp=data.get("isp", ""),
+            raw=data,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# XdbGeo — 离线 xdb 兜底（ip2region）                                          #
+# --------------------------------------------------------------------------- #
+
+# 容错导入：py-ip2region 包（pip install py-ip2region），缺失时不崩溃
+_xdb_searcher = None  # ip2region.searcher 模块
+_xdb_util = None      # ip2region.util 模块
+
+try:
+    import ip2region.searcher as _xdb_searcher  # type: ignore[import]
+    import ip2region.util as _xdb_util          # type: ignore[import]
+except ImportError:
+    pass  # 包未安装时，XdbGeo.lookup 将返回 None
+
+
+class XdbGeo:
+    """
+    ip2region xdb 离线查询（全内存模式，无网络依赖）。
+
+    构造时不抛出异常：包未安装或 xdb 文件不存在均被静默处理，
+    lookup 在此类情况下返回 None。
+
+    py-ip2region 返回格式：国家|省|市|ISP|iso（管道分隔，共 5 段）。
+    全内存模式下 searcher 对象线程安全，可跨线程复用。
+    """
+
+    def __init__(self, xdb_path: str) -> None:
+        self._available = False
+        self._searcher = None
+
+        if not xdb_path:
+            return
+
+        if _xdb_searcher is None or _xdb_util is None:
+            logger.debug("XdbGeo: py-ip2region 包未安装，已禁用")
+            return
+
+        from pathlib import Path as _Path
+        if not _Path(xdb_path).exists():
+            logger.warning("XdbGeo: xdb 文件不存在: %s", xdb_path)
+            return
+
+        try:
+            # 全内存模式：将整个 xdb 文件读入内存，查询时零 IO，线程安全
+            c_buffer = _xdb_util.load_content_from_file(xdb_path)
+            self._searcher = _xdb_searcher.new_with_buffer(_xdb_util.IPv4, c_buffer)
+            self._available = True
+        except Exception as e:
+            logger.warning("XdbGeo: 加载 xdb 失败: %s", e)
+
+    def lookup(self, ip: str) -> Optional[IpInfo]:
+        """查询 IP 归属地。不可用时返回 None 而非抛出异常。"""
+        if not self._available or self._searcher is None:
+            return None
+
+        # 校验 IP 格式，无效时直接返回 None，与其他 provider 行为一致
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            return None
+
+        try:
+            result: str = self._searcher.search(ip)
+        except Exception as e:
+            logger.debug("XdbGeo.lookup(%s) 失败: %s", ip, e)
+            return None
+
+        if not result:
+            return None
+
+        # py-ip2region 格式：国家|省|市|ISP|iso（共 5 段，缺位用 0 填充）
+        # 例：中国|广东省|深圳市|电信|CN  /  Australia|Queensland|Brisbane|0|AU
+        parts = result.split("|")
+        country  = parts[0].strip() if len(parts) > 0 else ""
+        province = parts[1].strip() if len(parts) > 1 else ""
+        city     = parts[2].strip() if len(parts) > 2 else ""
+        isp      = parts[3].strip() if len(parts) > 3 else ""
+
+        # xdb 中未知字段通常填充 "0"
+        def clean(s: str) -> str:
+            return "" if s == "0" else s
+
+        return IpInfo(
+            ip=ip,
+            country=clean(country),
+            province=clean(province),
+            city=clean(city),
+            isp=clean(isp),
+        )
+
+
+# --------------------------------------------------------------------------- #
 # GeoService — 统一入口（供 handlers 调用）                                     #
 # --------------------------------------------------------------------------- #
 
@@ -431,6 +595,8 @@ class GeoService:
         data_dir: Path,
         proxy_url: str = "",
         online_provider: str = "ip-api",
+        ip2location_io_key: str = "",
+        ip2region_xdb: str = "",
     ) -> None:
         self._offline = OfflineGeo(data_dir=data_dir, proxy_url=proxy_url)
         self._online = OnlineGeo(
@@ -438,6 +604,29 @@ class GeoService:
             proxy_url=proxy_url,
         )
         self._registry = get_registry()
+
+        # 可选在线主源（ip2location.io）
+        self._ip2location: Optional[IP2LocationIoGeo] = None
+        if ip2location_io_key:
+            try:
+                self._ip2location = IP2LocationIoGeo(
+                    key=ip2location_io_key,
+                    proxy_url=proxy_url,
+                )
+            except Exception as e:
+                logger.warning("GeoService: 初始化 IP2LocationIoGeo 失败: %s", e)
+
+        # 可选离线 xdb 兜底（ip2region）
+        self._xdb: Optional[XdbGeo] = None
+        if ip2region_xdb:
+            self._xdb = XdbGeo(xdb_path=ip2region_xdb)
+            # 修复 #5: 配置了 xdb 路径但加载失败时记录 warning，便于排查
+            if not self._xdb._available:
+                logger.warning(
+                    "GeoService: ip2region xdb 已配置但加载不可用（路径=%r），"
+                    "xdb 降级将跳过。",
+                    ip2region_xdb,
+                )
 
     def lookup_cidrs_for_area(
         self, code: str, force_refresh: bool = False
@@ -454,7 +643,29 @@ class GeoService:
         return collapse_cidrs(raw)
 
     def lookup_ip(self, ip: str) -> IpInfo:
-        """在线正向查询 IP 归属地。"""
+        """
+        在线正向查询 IP 归属地。
+        级联顺序：IP2LocationIoGeo（在线主源）→ XdbGeo（离线 xdb）→ OnlineGeo（ip-api）。
+        """
+        # 1. ip2location.io（在线主源，需 key）
+        if self._ip2location is not None:
+            try:
+                return self._ip2location.lookup(ip)
+            except Exception as e:
+                # 修复 #3: 双保险 — redact_credentials 过滤异常消息中可能残留的凭据
+                logger.warning(
+                    "IP2LocationIoGeo 查询失败，降级至下一级: %s",
+                    redact_credentials(str(e)),
+                )
+
+        # 2. xdb 离线（ip2region）
+        if self._xdb is not None:
+            result = self._xdb.lookup(ip)
+            if result is not None:
+                return result
+            logger.debug("XdbGeo 无结果 for %s，降级至 ip-api", ip)
+
+        # 3. ip-api（兜底）
         return self._online.lookup(ip)
 
     def search_area(self, query: str) -> list[GeoArea]:

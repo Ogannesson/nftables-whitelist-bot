@@ -9,7 +9,10 @@
 - **覆盖两条入站路径**：`input`（本机服务）+ `forward`（docker 发布端口、NAT DNAT 转发）
 - 容器/内网主动出网不受影响（私有源 10/8、172.16/12、192.168/16 在 forward chain 放行）
 - SSH 22 永久放行（绝不锁死服务器）
-- 提供 `/panic` 紧急解除一切限制
+- **三态防火墙模式**：正常 / 封城（仅 SSH+established）/ 放行（完全开放）；模式持久化，重启保持
+- **web auth 自动加白**：Cloudflare Worker + Access 触发，bot 定时 pull，访客认证即自动入白名单（🤖 标注）
+- **归属查询精度提升**：在线优先 IP2Location.io（精确到省市），离线兜底 ip2region xdb，最后 ip-api
+- 提供 `/panic` 临时放行（不持久，重启自动恢复白名单）
 - **启用即对所有公网入站生效——务必先填白名单再依赖它**
 
 ## 目录结构
@@ -89,9 +92,21 @@ url = "socks5h://127.0.0.1:1080"   # SOCKS5 代理，socks5h = DNS 由代理端�
 
 [geo]
 data_dir = "/opt/tg-whitelist/data"
+# IP2Location.io API Key（可选，免费 50k 次/月，精确到省市）
+# ip2location_io_key = "your_key_here"
+# ip2region 离线 xdb 路径（可选，离线精度）
+# ip2region_xdb = "/opt/tg-whitelist/data/ip2region.xdb"
 
 [database]
 path = "/opt/tg-whitelist/whitelist.db"
+
+# CF Worker 自动加白（可选，详见 docs/deploy/web-auth.md）
+[cf_pull]
+enabled = false
+worker_url = ""          # CF Worker 端点 URL
+access_client_id = ""    # CF Access Service Token Client ID
+access_client_secret = ""  # CF Access Service Token Client Secret
+poll_interval_seconds = 300
 ```
 
 也可以用环境变量覆盖（适合 CI/CD）：
@@ -110,6 +125,9 @@ sudo -u tgwl /opt/tg-whitelist/.venv/bin/python scripts/fetch_geo.py --provinces
 
 # 下载全部省市（较慢）
 sudo -u tgwl /opt/tg-whitelist/.venv/bin/python scripts/fetch_geo.py --all
+
+# 下载 ip2region 离线 xdb（可选，用于离线精度归属）
+sudo -u tgwl /opt/tg-whitelist/.venv/bin/python scripts/fetch_geo.py --ip2region-xdb
 ```
 
 省市数据也可按需下载（首次点选某省时自动触发，会稍慢）。
@@ -146,13 +164,23 @@ nft list chain inet whitelist forward
 | 按钮 | 功能 |
 |---|---|
 | 添加白名单 | 引导式：选类型→输入/选省市→确认 |
-| 查看/管理 | 列出条目，点删除图标移除 |
-| 查询 IP 归属 | 输入 IP → 返回省市/ISP → 可一键加白名单 |
-| 状态 | 防火墙状态、CIDR 数、代理配置 |
+| 查看/管理 | 列出条目，点删除图标移除；🤖 标注的条目为 web auth 自动加白 |
+| 查询 IP 归属 | 输入 IP → 返回省市/ISP（IP2Location.io → xdb → ip-api 三级查询）→ 可一键加白名单 |
+| 状态 | 防火墙状态、CIDR 数、代理配置、当前防火墙模式 |
 | 管理员管理 | 添加/撤销管理员（仅主管理员） |
-| 紧急解除（Panic） | 删除整个 whitelist table，立即解除所有限制 |
+| 防火墙模式 | 三态切换（均二次确认）：正常 / 封城 / 放行 |
 
-紧急情况也可直接发送 `/panic` 指令（需二次确认）。
+### 三态防火墙模式说明
+
+| 模式 | 行为 | 持久化 |
+|---|---|---|
+| **正常（normal）** | 白名单正常生效，默认模式 | 是 |
+| **封城（lockdown）** | 清空 whitelist set、只保留 SSH/lo/established，封锁其余公网入站；DB 条目保留，切回正常自动恢复 | 是 |
+| **放行（open）** | 删除整个 whitelist table，完全开放，等同原 Panic 效果 | 是 |
+
+三种模式均通过主菜单「防火墙模式」面板操作，每次切换需二次确认。模式持久化存储，重启后自动按上次模式恢复。
+
+`/panic` 指令保留为**临时**放行：效果等同 open 模式，但不持久——重启后 Bot 自动恢复白名单（normal 模式）。
 
 ## 防锁死设计与覆盖范围
 
@@ -183,8 +211,9 @@ nft list chain inet whitelist forward
 
 - **任何情况下**，SSH 22 均可到达（已建连的 SSH session 也不会被切断）
 - **容器出网不受影响**：私有源（容器/内网）发出的包在 forward chain 规则 4 放行
+- 封城模式下仅保留 SSH/lo/established，白名单 set 清空但 DB 条目保留；切回正常模式自动恢复
 - `/panic` 或重启后 Bot 未启动时：table 不存在，现有规则不受影响（fail-open）
-- Bot 重启后自动从 SQLite 恢复防火墙规则
+- Bot 重启后按持久化的防火墙模式自动从 SQLite 恢复防火墙规则
 - **注意**：启用后对所有公网入站立即生效（包括 docker 发布端口）——务必先填好白名单再开启
 
 ### 数据库与防火墙的最终一致性
@@ -218,14 +247,46 @@ nft list chain inet whitelist forward
 
 ### 在线 IP 查询 Provider
 
-`/whois` 使用免 key 的 `ip-api.com`（`lang=zh-CN`，走配置的 SOCKS5 代理），查不到时离线库兜底。省市白名单反查纯离线（metowolf/iplist + ip2region），无需任何在线 API key。
+`/whois`（查询 IP 归属）按以下三级优先级查询，走配置的 SOCKS5 代理：
+
+| 优先级 | Provider | 说明 |
+|---|---|---|
+| 1 | **IP2Location.io**（在线，有 key）| 精确到省市，免费 50k 次/月；需在 `[geo]` 配置 `ip2location_io_key` |
+| 2 | **ip2region xdb**（离线，有文件）| 本地精度优化，无网络依赖；需先用 `scripts/fetch_geo.py --ip2region-xdb` 下载 |
+| 3 | **ip-api.com**（在线，免 key）| 兜底方案，无需任何 API 凭据 |
+
+三个 provider 均未配置时，`/whois` 返回无法查询提示。省市白名单反查纯离线（metowolf/iplist），无需在线 API。
 
 注意：在线 provider 仅支持正向查询（IP → 省市），不能反查省市的 IP 段。
 省市 IP 段反查依赖离线 `metowolf/iplist` 数据。
 
 ## 在线归属查询安全
 
-已移除需要 API key 的腾讯地图和高德 provider，仅保留免 key 的 ip-api.com，无 key 泄漏面。
+API key 通过 `config.toml`（`chmod 600`）或环境变量传入，不硬编码在代码中。ip2location_io_key 可选，留空时自动跳过，不存在 key 泄漏面；ip-api.com 作为兜底无需任何凭据。
+
+## web auth 自动加白
+
+通过 Cloudflare Workers + Cloudflare Access，访客访问受保护的 URL 完成认证后，边缘侧捕获真实 IP 并写入 KV，Bot 定时 SOCKS5 pull 并自动永久加白。
+
+### 一键部署 Cloudflare Worker
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Ogannesson/nftables-whitelist-bot/tree/main/cloudflare/worker)
+
+点击按钮，Cloudflare 会 clone 本 Worker 子目录到你的账号、自动创建 KV、配 Workers Builds（CI/CD，后续 push 自动部署）、提示填 4 个 secret：
+
+| Secret | 说明 |
+|---|---|
+| `TEAM_DOMAIN` | Cloudflare Access team 域名，如 `https://yourteam.cloudflareaccess.com` |
+| `POLICY_AUD` | 你在 Access 创建的应用 AUD tag |
+| `PULL_CLIENT_ID` | Service Token Client ID（含 `.access` 后缀） |
+| `PULL_CLIENT_SECRET` | Service Token Client Secret |
+
+部署后仍需在 Cloudflare Zero Trust 创建 Access 应用保护 Worker 的 `GET /`、创建 Service Token，并把 Worker URL + Service Token 填入 bot 的 `config.toml [cf_pull]`。详见 [`docs/deploy/web-auth.md`](docs/deploy/web-auth.md)。
+
+- 服务器无需开放任何入站端口（无 Webhook、无 cloudflared）
+- 加白条目在列表中以 🤖 标注，来源可追溯
+- 封城/放行模式下 pull 只写 DB，不影响当前防火墙状态
+- 详细部署步骤见 [`docs/deploy/web-auth.md`](docs/deploy/web-auth.md)
 
 ## 常见问题
 
@@ -248,7 +309,7 @@ systemctl show tg-whitelist | grep Cap
 A: 先运行 `scripts/fetch_geo.py` 下载数据，或点「状态→同步省市数据」。
 
 **Q: 误操作想撤销防火墙**
-A: 发送 `/panic` 或点主菜单「紧急解除」，二次确认后 table 立即删除。
+A: 点主菜单「防火墙模式」，切换到 open（二次确认后 table 立即删除）。也可发送 `/panic`（临时放行，不写入持久状态，重启后自动恢复白名单）。若只是想开放部分入站，切 normal 或 lockdown 即可。
 ```
 
 ## 开发

@@ -33,6 +33,7 @@ from tgwl.handlers.common import require_admin, parse_ip_or_cidr, entry_type_for
 from tgwl.firewall import FirewallManager, collapse_cidrs
 from tgwl.store import Store
 from tgwl.geo import GeoService
+from tgwl.reconcile import reconcile_from_store
 
 logger = logging.getLogger(__name__)
 
@@ -65,21 +66,14 @@ async def _do_reconcile(
             "请检查 nftables 权限并重启 Bot 后再操作。"
         )
 
-    ip_entries = store.get_all_ip_entries()
-    geo_entries = store.get_all_geo_entries()
+    mode = store.get_setting("firewall_mode") or "normal"
+    if mode == "lockdown":
+        raise RuntimeError(
+            "当前为封锁(lockdown)模式，白名单暂不生效；"
+            "条目已保存，切回「正常」模式后自动应用。"
+        )
 
-    all_cidrs: list[str] = []
-    # IP / CIDR 直接用
-    for e in ip_entries:
-        all_cidrs.append(e.value)
-    # 省市展开
-    for e in geo_entries:
-        cidrs = geo.lookup_cidrs_for_area(e.value)
-        all_cidrs.extend(cidrs)
-
-    collapsed = collapse_cidrs(all_cidrs)
-    nets = {ipaddress.IPv4Network(c) for c in collapsed}
-    return fw.reconcile(nets)
+    return reconcile_from_store(store, geo, fw)
 
 
 # --------------------------------------------------------------------------- #

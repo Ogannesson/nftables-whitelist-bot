@@ -16,6 +16,7 @@ bot.py — Bot 主程序入口
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from pathlib import Path
@@ -30,9 +31,11 @@ from telegram.ext import (
 )
 
 from tgwl.config import Config, init_config, redact_credentials
+from tgwl.cf_pull import CFPullClient
 from tgwl.store import Store
 from tgwl.firewall import FirewallManager, collapse_cidrs, get_firewall_manager
 from tgwl.geo import GeoService
+from tgwl.reconcile import reconcile_from_store
 from tgwl.handlers.common import require_admin
 
 import tgwl.handlers.menu as menu_h
@@ -42,6 +45,7 @@ import tgwl.handlers.whois as whois_h
 import tgwl.handlers.status as status_h
 import tgwl.handlers.admin_mgr as admin_h
 import tgwl.handlers.panic as panic_h
+import tgwl.handlers.mode as mode_h
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +164,29 @@ def register_handlers(app: Application) -> None:
         CallbackQueryHandler(panic_h.cb_panic_do, pattern=r"^panic:do$")
     )
 
+    # ---- 模式切换 ----
+    app.add_handler(
+        CallbackQueryHandler(mode_h.cb_mode_panel, pattern=r"^mode:panel$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(mode_h.cb_mode_set_normal, pattern=r"^mode:set:normal$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(mode_h.cb_mode_set_lockdown, pattern=r"^mode:set:lockdown$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(mode_h.cb_mode_set_open, pattern=r"^mode:set:open$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(mode_h.cb_mode_do_normal, pattern=r"^mode:do:normal$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(mode_h.cb_mode_do_lockdown, pattern=r"^mode:do:lockdown$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(mode_h.cb_mode_do_open, pattern=r"^mode:do:open$")
+    )
+
     # ---- Noop ----
     app.add_handler(
         CallbackQueryHandler(_cb_admin_noop, pattern=r"^admin:noop$")
@@ -184,38 +211,31 @@ def main(config_path: str | Path | None = None) -> None:
         data_dir=cfg.geo.data_dir,
         proxy_url=cfg.proxy.url,
         online_provider=cfg.geo.online_provider,
+        ip2location_io_key=cfg.geo.ip2location_io_key,
+        ip2region_xdb=cfg.geo.ip2region_xdb,
     )
 
-    # 启动时恢复防火墙
-    # 策略：
-    #   - ensure_setup 成功 → 正常运行
-    #   - ensure_setup 失败（含建表失败的危险状态）→ 记录 CRITICAL 日志，
-    #     在 bot_data 中标记 firewall_ok=False，所有防火墙变更操作拒绝执行
-    #     （不能静默继续，否则用户以为添加了白名单但实际无效）
-    #   - 若平台非 Linux 或无权限 → 同上，fail 模式（开发环境正常）
-    import ipaddress as _ipaddress
+    # 启动时按持久化模式恢复防火墙
+    mode = store.get_setting("firewall_mode") or "normal"
+    if mode not in ("normal", "lockdown", "open"):
+        logger.warning("firewall_mode 无效值 %r，降级为 normal", mode)
+        mode = "normal"
     firewall_ok = False
     try:
-        fw.ensure_setup()
-        logger.info("防火墙 table 已就绪")
-        # 从 SQLite 重建 whitelist4
-        ip_entries = store.get_all_ip_entries()
-        geo_entries = store.get_all_geo_entries()
-        all_cidrs: list[str] = [e.value for e in ip_entries]
-        for e in geo_entries:
-            all_cidrs.extend(geo.lookup_cidrs_for_area(e.value))
-        collapsed = collapse_cidrs(all_cidrs)
-        nets = {_ipaddress.IPv4Network(c) for c in collapsed}
-        count = fw.reconcile(nets)
-        logger.info("防火墙白名单已恢复：%d 条 CIDR", count)
-        firewall_ok = True
+        if mode == "open":
+            logger.info("firewall_mode=open：启动时不建表，完全放行（fail-open）")
+            # 不建表；firewall_ok 保持 False
+        else:
+            fw.ensure_setup()
+            if mode == "lockdown":
+                fw.reconcile(set())
+                logger.info("firewall_mode=lockdown：已封锁所有新入站")
+            else:
+                count = reconcile_from_store(store, geo, fw)
+                logger.info("firewall_mode=normal：白名单已恢复，%d 条 CIDR", count)
+            firewall_ok = True
     except Exception as e:
-        logger.critical(
-            "防火墙初始化失败，Bot 将以「防火墙不可用」模式运行。"
-            "所有添加/删除白名单操作将被拒绝，直到重启并修复问题。"
-            "错误: %s",
-            redact_credentials(str(e)),
-        )
+        logger.critical("防火墙初始化失败，以「不可用」模式运行... 错误: %s", redact_credentials(str(e)))
 
     # 构建 Application
     app = build_application(cfg)
@@ -229,6 +249,37 @@ def main(config_path: str | Path | None = None) -> None:
     app.bot_data["firewall_ok"] = firewall_ok
 
     register_handlers(app)
+
+    # CF Worker 自动加白定时任务
+    if cfg.cf_pull.enabled and cfg.cf_pull.worker_url:
+        async def _cf_pull_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+            if not context.bot_data.get("firewall_ok"):
+                logger.warning("cf_pull: firewall_ok=False，跳过本次拉取")
+                return
+            _store = context.bot_data["store"]
+            _geo = context.bot_data["geo"]
+            _fw = context.bot_data["firewall"]
+            client = CFPullClient(
+                cfg.cf_pull.worker_url,
+                cfg.cf_pull.access_client_id,
+                cfg.cf_pull.access_client_secret,
+                proxy_url=cfg.proxy.url,
+            )
+            try:
+                await asyncio.to_thread(client.process, _store, _geo, _fw)
+            except Exception as e:
+                logger.error("cf_pull job 失败: %s", redact_credentials(str(e)))
+
+        app.job_queue.run_repeating(
+            _cf_pull_job,
+            interval=cfg.cf_pull.poll_interval_seconds,
+            first=10,
+        )
+        logger.info(
+            "CF Pull 定时任务已启用，间隔 %d 秒，首次执行延迟 10 秒",
+            cfg.cf_pull.poll_interval_seconds,
+        )
+
     logger.info("Bot 启动，开始 polling...")
     app.run_polling(allowed_updates=["message", "callback_query"])
 

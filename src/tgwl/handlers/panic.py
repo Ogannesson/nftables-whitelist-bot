@@ -66,7 +66,7 @@ async def cb_panic_do(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.edit_message_text(
             "已删除 table inet whitelist\n"
             "所有白名单限制已解除，SSH 等端口现在对所有 IP 开放。\n\n"
-            "白名单已解除，如需恢复请重启 Bot，将从数据库自动重建防火墙规则。"
+            "此操作为临时紧急放行，不持久化；Bot 重启后将从数据库自动恢复白名单。"
         )
     except RuntimeError as e:
         logger.error("panic 执行失败: %s", e)

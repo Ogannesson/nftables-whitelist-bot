@@ -8,9 +8,10 @@ version = "0.1.0"
 description = "Telegram bot for managing nftables IP whitelist"
 requires-python = ">=3.11"
 dependencies = [
-    "python-telegram-bot[socks]>=22.0",
+    "python-telegram-bot[socks,job-queue]>=22.0",
     "httpx[socks]>=0.27",
     "tomli>=2.0; python_version < '3.11'",
+    "py-ip2region>=3.0.4",
 ]
 
 [project.optional-dependencies]

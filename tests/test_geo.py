@@ -25,6 +25,8 @@ from tgwl.geo import (
     OnlineGeo,
     GeoService,
     IpInfo,
+    IP2LocationIoGeo,
+    XdbGeo,
     collapse_cidrs,
     get_registry,
 )
@@ -341,3 +343,438 @@ class TestGeoService:
         )
         result = service.ip2region_fallback("330000")
         assert any("10.0.0.0" in r for r in result)
+
+
+# --------------------------------------------------------------------------- #
+# IpInfo 新字段测试                                                             #
+# --------------------------------------------------------------------------- #
+
+class TestIpInfoAdcode:
+    def test_adcode_default_empty(self):
+        """adcode 字段默认值应为空字符串，保持向后兼容。"""
+        info = IpInfo(ip="1.2.3.4")
+        assert info.adcode == ""
+
+    def test_adcode_can_be_set(self):
+        info = IpInfo(ip="1.2.3.4", adcode="330100")
+        assert info.adcode == "330100"
+
+    def test_existing_construction_unchanged(self):
+        """原有构造方式（不传 adcode）不受影响。"""
+        info = IpInfo(ip="5.6.7.8", country="中国", province="浙江省",
+                      city="杭州市", isp="电信")
+        assert info.country == "中国"
+        assert info.adcode == ""
+
+
+# --------------------------------------------------------------------------- #
+# IP2LocationIoGeo 测试（mock httpx）                                           #
+# --------------------------------------------------------------------------- #
+
+class TestIP2LocationIoGeo:
+    def _make_mock_response(self, json_data: dict, status_code: int = 200) -> MagicMock:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = json_data
+        mock_resp.status_code = status_code
+        mock_resp.raise_for_status = MagicMock()
+        return mock_resp
+
+    def _make_client_context(self, response: MagicMock) -> MagicMock:
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.get = MagicMock(return_value=response)
+        return mock_client
+
+    def test_empty_key_raises(self):
+        """空 key 在构造时抛 ValueError。"""
+        with pytest.raises(ValueError, match="key"):
+            IP2LocationIoGeo(key="")
+
+    def test_success_field_mapping(self):
+        """正确解析 country_name/region_name/city_name/isp -> IpInfo 字段。"""
+        geo = IP2LocationIoGeo(key="testkey")
+        resp_data = {
+            "country_name": "China",
+            "region_name": "Zhejiang",
+            "city_name": "Hangzhou",
+            "isp": "China Telecom",
+        }
+        resp = self._make_mock_response(resp_data)
+        with patch("httpx.Client", return_value=self._make_client_context(resp)):
+            info = geo.lookup("1.2.3.4")
+        assert info.ip == "1.2.3.4"
+        assert info.country == "China"
+        assert info.province == "Zhejiang"
+        assert info.city == "Hangzhou"
+        assert info.isp == "China Telecom"
+        assert info.raw == resp_data
+
+    def test_http_error_raises(self):
+        """HTTP 非 200 时（raise_for_status 抛异常）应向上传播。"""
+        geo = IP2LocationIoGeo(key="testkey")
+        resp = self._make_mock_response({}, status_code=403)
+        resp.raise_for_status.side_effect = Exception("403 Forbidden")
+        with patch("httpx.Client", return_value=self._make_client_context(resp)):
+            with pytest.raises(Exception, match="403"):
+                geo.lookup("1.2.3.4")
+
+    def test_error_key_in_response_raises(self):
+        """响应 JSON 含 error 键时抛 RuntimeError。"""
+        geo = IP2LocationIoGeo(key="testkey")
+        resp_data = {"error": {"error_code": 10001, "error_message": "Invalid API key."}}
+        resp = self._make_mock_response(resp_data)
+        with patch("httpx.Client", return_value=self._make_client_context(resp)):
+            with pytest.raises(RuntimeError, match="ip2location.io"):
+                geo.lookup("8.8.8.8")
+
+    def test_invalid_ip_raises(self):
+        """无效 IP 字符串在 lookup 时抛 ValueError。"""
+        geo = IP2LocationIoGeo(key="testkey")
+        with pytest.raises(ValueError, match="无效 IP"):
+            with patch("httpx.Client"):
+                geo.lookup("not-an-ip")
+
+    def test_missing_fields_default_empty(self):
+        """响应中缺少某些字段时，对应 IpInfo 字段为空字符串。"""
+        geo = IP2LocationIoGeo(key="testkey")
+        resp_data = {"country_name": "United States"}
+        resp = self._make_mock_response(resp_data)
+        with patch("httpx.Client", return_value=self._make_client_context(resp)):
+            info = geo.lookup("8.8.8.8")
+        assert info.country == "United States"
+        assert info.province == ""
+        assert info.city == ""
+        assert info.isp == ""
+
+    def test_http_status_error_does_not_leak_key(self):
+        """HTTP 错误重新包装后，异常消息中不应含 API key（防止 key 泄漏进日志）。"""
+        import httpx
+
+        api_key = "super_secret_api_key_xyz"
+        geo = IP2LocationIoGeo(key=api_key)
+
+        # 构造一个带有完整 URL（含 key）的 HTTPStatusError，模拟 httpx 原生行为
+        fake_request = httpx.Request(
+            "GET",
+            f"https://api.ip2location.io/?key={api_key}&ip=1.2.3.4",
+        )
+        fake_response = MagicMock(spec=httpx.Response)
+        fake_response.status_code = 403
+        http_err = httpx.HTTPStatusError(
+            f"Client error '403 Forbidden' for url "
+            f"'https://api.ip2location.io/?key={api_key}&ip=1.2.3.4'",
+            request=fake_request,
+            response=fake_response,
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.side_effect = http_err
+        mock_client_ctx = self._make_client_context(mock_resp)
+
+        with patch("httpx.Client", return_value=mock_client_ctx):
+            with pytest.raises(RuntimeError) as exc_info:
+                geo.lookup("1.2.3.4")
+
+        raised_msg = str(exc_info.value)
+        assert api_key not in raised_msg, (
+            f"API key 泄漏进异常消息！raised: {raised_msg!r}"
+        )
+        # 应只含状态码，不含 URL 或 key
+        assert "403" in raised_msg
+
+    def test_request_error_does_not_leak_key(self):
+        """网络错误（RequestError）重新包装后，异常消息中不应含 API key。"""
+        import httpx
+
+        api_key = "another_secret_key_abc"
+        geo = IP2LocationIoGeo(key=api_key)
+
+        fake_request = httpx.Request(
+            "GET",
+            f"https://api.ip2location.io/?key={api_key}&ip=1.2.3.4",
+        )
+        net_err = httpx.ConnectError("Connection refused", request=fake_request)
+
+        mock_resp = MagicMock()
+        mock_client_ctx = self._make_client_context(mock_resp)
+        # 让 client.get() 直接抛 RequestError
+        mock_client_ctx.get.side_effect = net_err
+
+        with patch("httpx.Client", return_value=mock_client_ctx):
+            with pytest.raises(RuntimeError) as exc_info:
+                geo.lookup("1.2.3.4")
+
+        raised_msg = str(exc_info.value)
+        assert api_key not in raised_msg, (
+            f"API key 泄漏进异常消息！raised: {raised_msg!r}"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# XdbGeo 测试                                                                   #
+# --------------------------------------------------------------------------- #
+
+class TestXdbGeo:
+    def test_no_xdb_package_returns_none(self, monkeypatch):
+        """py-ip2region 包未安装时，lookup 返回 None，不崩溃。"""
+        import tgwl.geo as geo_module
+        monkeypatch.setattr(geo_module, "_xdb_searcher", None)
+        monkeypatch.setattr(geo_module, "_xdb_util", None)
+        xdb = XdbGeo(xdb_path="/nonexistent/path.xdb")
+        assert xdb.lookup("1.2.3.4") is None
+
+    def test_missing_file_returns_none(self, tmp_path):
+        """xdb 文件路径不存在时，lookup 返回 None，不崩溃。"""
+        xdb = XdbGeo(xdb_path=str(tmp_path / "nonexistent.xdb"))
+        assert xdb.lookup("1.2.3.4") is None
+
+    def test_empty_path_returns_none(self):
+        """路径为空字符串时，lookup 返回 None，不崩溃。"""
+        xdb = XdbGeo(xdb_path="")
+        assert xdb.lookup("1.2.3.4") is None
+
+    def test_successful_parse(self, tmp_path, monkeypatch):
+        """mock py-ip2region 正常返回管道分隔字符串时，正确解析各字段。"""
+        import tgwl.geo as geo_module
+
+        fake_xdb = tmp_path / "test.xdb"
+        fake_xdb.write_bytes(b"\x00" * 16)
+
+        mock_searcher = MagicMock()
+        # py-ip2region 真实格式：国家|省|市|ISP|iso
+        mock_searcher.search.return_value = "中国|浙江省|杭州市|中国电信|CN"
+
+        mock_xdb_mod = MagicMock()
+        mock_xdb_mod.new_with_buffer.return_value = mock_searcher
+
+        mock_util = MagicMock()
+        mock_util.load_content_from_file.return_value = b"\x00" * 16
+        mock_util.IPv4 = 0
+
+        monkeypatch.setattr(geo_module, "_xdb_searcher", mock_xdb_mod)
+        monkeypatch.setattr(geo_module, "_xdb_util", mock_util)
+
+        xdb = XdbGeo(xdb_path=str(fake_xdb))
+        info = xdb.lookup("1.2.3.4")
+
+        assert info is not None
+        assert info.country == "中国"
+        assert info.province == "浙江省"
+        assert info.city == "杭州市"
+        assert info.isp == "中国电信"
+
+    def test_zero_fields_cleaned(self, tmp_path, monkeypatch):
+        """pipe 分隔结果中 0 值应被清为空字符串。"""
+        import tgwl.geo as geo_module
+
+        fake_xdb = tmp_path / "test.xdb"
+        fake_xdb.write_bytes(b"\x00" * 16)
+
+        mock_searcher = MagicMock()
+        mock_searcher.search.return_value = "中国|0|0|0|0"
+
+        mock_xdb_mod = MagicMock()
+        mock_xdb_mod.new_with_buffer.return_value = mock_searcher
+
+        mock_util = MagicMock()
+        mock_util.load_content_from_file.return_value = b"\x00" * 16
+        mock_util.IPv4 = 0
+
+        monkeypatch.setattr(geo_module, "_xdb_searcher", mock_xdb_mod)
+        monkeypatch.setattr(geo_module, "_xdb_util", mock_util)
+
+        xdb = XdbGeo(xdb_path=str(fake_xdb))
+        info = xdb.lookup("1.2.3.4")
+
+        assert info is not None
+        assert info.country == "中国"
+        assert info.province == ""
+        assert info.city == ""
+        assert info.isp == ""
+
+    def test_search_exception_returns_none(self, tmp_path, monkeypatch):
+        """searcher.search() 抛异常时 lookup 返回 None，不崩溃。"""
+        import tgwl.geo as geo_module
+
+        fake_xdb = tmp_path / "test.xdb"
+        fake_xdb.write_bytes(b"\x00" * 16)
+
+        mock_searcher = MagicMock()
+        mock_searcher.search.side_effect = RuntimeError("xdb error")
+
+        mock_xdb_mod = MagicMock()
+        mock_xdb_mod.new_with_buffer.return_value = mock_searcher
+
+        mock_util = MagicMock()
+        mock_util.load_content_from_file.return_value = b"\x00" * 16
+        mock_util.IPv4 = 0
+
+        monkeypatch.setattr(geo_module, "_xdb_searcher", mock_xdb_mod)
+        monkeypatch.setattr(geo_module, "_xdb_util", mock_util)
+
+        xdb = XdbGeo(xdb_path=str(fake_xdb))
+        assert xdb.lookup("1.2.3.4") is None
+
+    def test_load_content_failure_returns_none(self, tmp_path, monkeypatch):
+        """load_content_from_file 抛异常时 XdbGeo 不可用，lookup 返回 None。"""
+        import tgwl.geo as geo_module
+
+        fake_xdb = tmp_path / "test.xdb"
+        fake_xdb.write_bytes(b"\x00" * 16)
+
+        mock_xdb_mod = MagicMock()
+
+        mock_util = MagicMock()
+        mock_util.load_content_from_file.side_effect = OSError("read error")
+        mock_util.IPv4 = 0
+
+        monkeypatch.setattr(geo_module, "_xdb_searcher", mock_xdb_mod)
+        monkeypatch.setattr(geo_module, "_xdb_util", mock_util)
+
+        xdb = XdbGeo(xdb_path=str(fake_xdb))
+        assert xdb.lookup("1.1.1.1") is None
+
+
+# --------------------------------------------------------------------------- #
+# GeoService 级联测试（新增）                                                    #
+# --------------------------------------------------------------------------- #
+
+class TestGeoServiceCascade:
+    @pytest.fixture(autouse=True)
+    def mock_registry(self, monkeypatch):
+        """阻止 GeoService.__init__ 触发 RegionRegistry 文件读取。"""
+        import tgwl.geo as geo_module
+        monkeypatch.setattr(geo_module, "get_registry", lambda: MagicMock())
+
+    def _make_mock_response(self, json_data: dict) -> MagicMock:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = json_data
+        mock_resp.raise_for_status = MagicMock()
+        return mock_resp
+
+    def _make_client_context(self, response: MagicMock) -> MagicMock:
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.get = MagicMock(return_value=response)
+        return mock_client
+
+    def test_ip2location_used_when_key_provided(self, tmp_path):
+        """提供 ip2location_io_key 时，lookup_ip 使用 IP2LocationIoGeo 结果。"""
+        resp_data = {
+            "country_name": "Japan",
+            "region_name": "Tokyo",
+            "city_name": "Tokyo",
+            "isp": "NTT",
+        }
+        resp = self._make_mock_response(resp_data)
+        svc = GeoService(data_dir=tmp_path, ip2location_io_key="testkey")
+        with patch("httpx.Client", return_value=self._make_client_context(resp)):
+            info = svc.lookup_ip("1.2.3.4")
+        assert info.country == "Japan"
+        assert info.province == "Tokyo"
+
+    def test_ip2location_error_falls_to_ip_api(self, tmp_path):
+        """IP2LocationIoGeo 抛异常时降级至 ip-api（OnlineGeo）。"""
+        ip_api_data = {
+            "status": "success",
+            "country": "中国",
+            "regionName": "浙江省",
+            "city": "杭州市",
+            "isp": "电信",
+        }
+
+        svc = GeoService(data_dir=tmp_path, ip2location_io_key="badkey")
+
+        def client_factory(*args, **kwargs):
+            ctx = MagicMock()
+            ctx.__enter__ = MagicMock(return_value=ctx)
+            ctx.__exit__ = MagicMock(return_value=False)
+
+            def smart_get(url, **kw):
+                if "ip2location.io" in url:
+                    raise RuntimeError("network error")
+                return self._make_mock_response(ip_api_data)
+
+            ctx.get = smart_get
+            return ctx
+
+        with patch("httpx.Client", side_effect=client_factory):
+            info = svc.lookup_ip("1.2.3.4")
+        assert info.province == "浙江省"
+
+    def test_xdb_used_when_ip2location_absent(self, tmp_path, monkeypatch):
+        """无 ip2location key、有 xdb 时，lookup_ip 使用 XdbGeo 结果。"""
+        import tgwl.geo as geo_module
+
+        fake_xdb = tmp_path / "test.xdb"
+        fake_xdb.write_bytes(b"\x00" * 16)
+
+        mock_searcher = MagicMock()
+        # py-ip2region 格式：国家|省|市|ISP|iso
+        mock_searcher.search.return_value = "中国|上海市|上海市|联通|CN"
+
+        mock_xdb_mod = MagicMock()
+        mock_xdb_mod.new_with_buffer.return_value = mock_searcher
+
+        mock_util = MagicMock()
+        mock_util.load_content_from_file.return_value = b"\x00" * 16
+        mock_util.IPv4 = 0
+
+        monkeypatch.setattr(geo_module, "_xdb_searcher", mock_xdb_mod)
+        monkeypatch.setattr(geo_module, "_xdb_util", mock_util)
+
+        svc = GeoService(data_dir=tmp_path, ip2region_xdb=str(fake_xdb))
+        info = svc.lookup_ip("1.2.3.4")
+        assert info.city == "上海市"
+        assert info.isp == "联通"
+
+    def test_xdb_none_falls_to_ip_api(self, tmp_path, monkeypatch):
+        """xdb 返回 None 时降级至 ip-api。"""
+        import tgwl.geo as geo_module
+
+        fake_xdb = tmp_path / "test.xdb"
+        fake_xdb.write_bytes(b"\x00" * 16)
+
+        mock_searcher = MagicMock()
+        mock_searcher.search.return_value = ""
+
+        mock_xdb_mod = MagicMock()
+        mock_xdb_mod.new_with_buffer.return_value = mock_searcher
+
+        mock_util = MagicMock()
+        mock_util.load_content_from_file.return_value = b"\x00" * 16
+        mock_util.IPv4 = 0
+
+        monkeypatch.setattr(geo_module, "_xdb_searcher", mock_xdb_mod)
+        monkeypatch.setattr(geo_module, "_xdb_util", mock_util)
+
+        ip_api_data = {
+            "status": "success",
+            "country": "德国",
+            "regionName": "Bavaria",
+            "city": "Munich",
+            "isp": "Deutsche Telekom",
+        }
+        resp = self._make_mock_response(ip_api_data)
+
+        svc = GeoService(data_dir=tmp_path, ip2region_xdb=str(fake_xdb))
+        with patch("httpx.Client", return_value=self._make_client_context(resp)):
+            info = svc.lookup_ip("5.6.7.8")
+        assert info.country == "德国"
+
+    def test_no_new_providers_uses_ip_api(self, tmp_path):
+        """不传新参数时行为与原 GeoService 一致（只用 ip-api）。"""
+        ip_api_data = {
+            "status": "success",
+            "country": "美国",
+            "regionName": "California",
+            "city": "San Jose",
+            "isp": "Cloudflare",
+        }
+        resp = self._make_mock_response(ip_api_data)
+        svc = GeoService(data_dir=tmp_path)
+        with patch("httpx.Client", return_value=self._make_client_context(resp)):
+            info = svc.lookup_ip("1.1.1.1")
+        assert info.country == "美国"

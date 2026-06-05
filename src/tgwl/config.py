@@ -5,11 +5,16 @@ config.py — 配置加载层
 凭据（token、代理密码、API key）不打日志，不入 SQLite。
 
 环境变量优先级高于配置文件，便于 systemd EnvironmentFile 注入：
-  TGWL_TOKEN          → bot.token
-  TGWL_PRIMARY_ADMIN  → bot.primary_admin
-  TGWL_PROXY_URL      → proxy.url
-  TGWL_DB_PATH        → database.path
-  TGWL_DATA_DIR       → geo.data_dir
+  TGWL_TOKEN                  → bot.token
+  TGWL_PRIMARY_ADMIN          → bot.primary_admin
+  TGWL_PROXY_URL              → proxy.url
+  TGWL_DB_PATH                → database.path
+  TGWL_DATA_DIR               → geo.data_dir
+  TGWL_CF_PULL_ENABLED        → cf_pull.enabled
+  TGWL_CF_WORKER_URL          → cf_pull.worker_url
+  TGWL_CF_ACCESS_CLIENT_ID    → cf_pull.access_client_id
+  TGWL_CF_ACCESS_CLIENT_SECRET → cf_pull.access_client_secret
+  TGWL_CF_PULL_INTERVAL       → cf_pull.poll_interval_seconds
 """
 
 from __future__ import annotations
@@ -71,6 +76,8 @@ class ProxyConfig:
 class GeoConfig:
     data_dir: Path
     online_provider: str = "ip-api"
+    ip2location_io_key: str = ""
+    ip2region_xdb: str = ""
 
 
 @dataclass
@@ -79,11 +86,22 @@ class DatabaseConfig:
 
 
 @dataclass
+class CFPullConfig:
+    """CF Worker 自动加白的服务器侧 pull 配置。"""
+    enabled: bool = False
+    worker_url: str = ""
+    access_client_id: str = ""
+    access_client_secret: str = ""
+    poll_interval_seconds: int = 300
+
+
+@dataclass
 class Config:
     bot: BotConfig
     proxy: ProxyConfig
     geo: GeoConfig
     database: DatabaseConfig
+    cf_pull: CFPullConfig = field(default_factory=CFPullConfig)
 
     # 运行时派生字段（不来自配置文件）
     config_path: Path = field(default_factory=lambda: Path("config.toml"))
@@ -139,14 +157,69 @@ class Config:
         if not db_path.is_absolute():
             db_path = base_dir / db_path
 
+        ip2location_io_key = (
+            os.environ.get("TGWL_IP2LOCATION_IO_KEY")
+            or geo_raw.get("ip2location_io_key", "")
+        )
+        ip2region_xdb = (
+            os.environ.get("TGWL_IP2REGION_XDB")
+            or geo_raw.get("ip2region_xdb", "")
+        )
+
+        # CF Pull 配置
+        cf_pull_raw = raw.get("cf_pull", {})
+
+        def _parse_bool(val: str) -> bool:
+            return val.strip().lower() in ("1", "true", "yes")
+
+        cf_enabled_env = os.environ.get("TGWL_CF_PULL_ENABLED")
+        if cf_enabled_env is not None:
+            cf_enabled = _parse_bool(cf_enabled_env)
+        else:
+            cf_enabled_raw = cf_pull_raw.get("enabled", False)
+            if isinstance(cf_enabled_raw, bool):
+                cf_enabled = cf_enabled_raw
+            else:
+                cf_enabled = _parse_bool(str(cf_enabled_raw))
+
+        cf_worker_url = os.environ.get("TGWL_CF_WORKER_URL") or cf_pull_raw.get("worker_url", "")
+        cf_client_id = (
+            os.environ.get("TGWL_CF_ACCESS_CLIENT_ID")
+            or cf_pull_raw.get("access_client_id", "")
+        )
+        cf_client_secret = (
+            os.environ.get("TGWL_CF_ACCESS_CLIENT_SECRET")
+            or cf_pull_raw.get("access_client_secret", "")
+        )
+        cf_interval_env = os.environ.get("TGWL_CF_PULL_INTERVAL")
+        if cf_interval_env is not None:
+            try:
+                cf_interval = int(cf_interval_env)
+            except ValueError:
+                cf_interval = 300
+        else:
+            try:
+                cf_interval = int(cf_pull_raw.get("poll_interval_seconds", 300))
+            except (ValueError, TypeError):
+                cf_interval = 300
+
         cfg = cls(
             bot=BotConfig(token=token, primary_admin=primary_admin),
             proxy=ProxyConfig(url=proxy_url),
             geo=GeoConfig(
                 data_dir=data_dir,
                 online_provider=geo_raw.get("online_provider", "ip-api"),
+                ip2location_io_key=ip2location_io_key,
+                ip2region_xdb=ip2region_xdb,
             ),
             database=DatabaseConfig(path=db_path),
+            cf_pull=CFPullConfig(
+                enabled=cf_enabled,
+                worker_url=cf_worker_url,
+                access_client_id=cf_client_id,
+                access_client_secret=cf_client_secret,
+                poll_interval_seconds=cf_interval,
+            ),
             config_path=config_path or Path("config.toml"),
         )
         cfg._validate()
@@ -190,12 +263,25 @@ class Config:
             f"***{self.bot.token[-6:]}" if len(self.bot.token) > 6 else "***"
         ) if self.bot.token else "(未设置)"
         proxy_hint = self._redact_proxy_url(self.proxy.url) if self.proxy.url else "(不走代理)"
+        key_hint = (
+            f"***{self.geo.ip2location_io_key[-4:]}"
+            if len(self.geo.ip2location_io_key) > 4
+            else "(已设置)"
+        ) if self.geo.ip2location_io_key else "(未设置)"
+        cf_secret_hint = (
+            f"***{self.cf_pull.access_client_secret[-4:]}"
+            if len(self.cf_pull.access_client_secret) > 4
+            else "(已设置)"
+        ) if self.cf_pull.access_client_secret else "(未设置)"
         return (
             f"Config(primary_admin={self.bot.primary_admin}, "
             f"token={token_hint}, "
             f"proxy={proxy_hint}, "
             f"db={self.database.path}, "
-            f"data_dir={self.geo.data_dir})"
+            f"data_dir={self.geo.data_dir}, "
+            f"ip2location_io_key={key_hint}, "
+            f"cf_pull_enabled={self.cf_pull.enabled}, "
+            f"cf_pull_secret={cf_secret_hint})"
         )
 
     @staticmethod

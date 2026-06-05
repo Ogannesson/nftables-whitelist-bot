@@ -1,0 +1,13 @@
+# Copy this file to .dev.vars for local development (never commit .dev.vars)
+# For production, set these as secrets via Workers Builds wizard or:
+#   wrangler secret put <NAME>
+
+# Cloudflare Access team domain, e.g. https://yourteam.cloudflareaccess.com
+TEAM_DOMAIN=https://YOUR-TEAM.cloudflareaccess.com
+
+# Access application Audience (AUD) tag (from the Access app you create to protect GET /)
+POLICY_AUD=YOUR_ACCESS_APP_AUD_TAG
+
+# Access Service Token (for the server-side /pull and /ack calls)
+PULL_CLIENT_ID=YOUR_SERVICE_TOKEN_CLIENT_ID.access
+PULL_CLIENT_SECRET=YOUR_SERVICE_TOKEN_CLIENT_SECRET

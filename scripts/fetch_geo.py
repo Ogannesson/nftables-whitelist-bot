@@ -40,6 +40,10 @@ IP2REGION_SOURCE_URL = (
     "data/ipv4_source.txt"
 )
 
+IP2REGION_XDB_URL = (
+    "https://github.com/adysec/IP_database/raw/main/ip2region/ip2region.xdb"
+)
+
 
 def download_all_provinces(geo: OfflineGeo, delay: float = 0.3) -> int:
     """下载所有省级数据。返回成功下载的数量。"""
@@ -101,6 +105,42 @@ def download_ip2region(data_dir: Path, proxy_url: str = "") -> None:
         raise
 
 
+def download_ip2region_xdb(cfg: "Config") -> None:
+    """下载 ip2region.xdb 二进制数据库到配置指定路径。"""
+    import httpx
+
+    # 确定目标路径：优先使用 cfg.geo.ip2region_xdb（若非空），否则落到 data_dir
+    xdb_str = cfg.geo.ip2region_xdb
+    if xdb_str:
+        out_file = Path(xdb_str)
+    else:
+        out_file = cfg.geo.data_dir / "ip2region.xdb"
+
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    proxy_url = cfg.proxy.url
+    proxies = {"all://": proxy_url} if proxy_url else None
+
+    logger.info("下载 ip2region.xdb -> %s ...", out_file)
+    try:
+        with httpx.Client(proxies=proxies, timeout=300, follow_redirects=True) as client:
+            with client.stream("GET", IP2REGION_XDB_URL) as resp:
+                resp.raise_for_status()
+                total = int(resp.headers.get("content-length", 0))
+                downloaded = 0
+                with open(out_file, "wb") as f:
+                    for chunk in resp.iter_bytes(chunk_size=65536):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total:
+                            pct = downloaded * 100 // total
+                            print(f"\r进度: {pct}% ({downloaded}/{total} bytes)", end="", flush=True)
+        print()  # 换行
+        logger.info("ip2region.xdb 下载完成: %s", out_file)
+    except Exception as e:
+        logger.error("ip2region.xdb 下载失败: %s", redact_credentials(str(e)))
+        raise
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="下载/更新省市地理 IP 数据"
@@ -111,6 +151,7 @@ def main() -> None:
     parser.add_argument("--cities-only", action="store_true", help="只下载市级数据")
     parser.add_argument("--code", help="只下载指定行政区划码（如 330000）")
     parser.add_argument("--ip2region", action="store_true", help="同时下载 ip2region 兜底库")
+    parser.add_argument("--ip2region-xdb", action="store_true", help="下载 ip2region.xdb 二进制库")
     parser.add_argument("--delay", type=float, default=0.3, help="下载间隔（秒），默认 0.3")
     args = parser.parse_args()
 
@@ -156,6 +197,9 @@ def main() -> None:
 
     if args.ip2region:
         download_ip2region(data_dir, proxy_url=proxy_url)
+
+    if args.ip2region_xdb:
+        download_ip2region_xdb(cfg)
 
     logger.info("数据目录: %s", data_dir.resolve())
 

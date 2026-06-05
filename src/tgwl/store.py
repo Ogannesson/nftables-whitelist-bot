@@ -79,6 +79,11 @@ CREATE TABLE IF NOT EXISTS entries (
 );
 
 CREATE INDEX IF NOT EXISTS idx_entries_type ON entries(type);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -359,6 +364,29 @@ class Store:
                 "SELECT * FROM entries WHERE type IN ('province', 'city') ORDER BY added_at ASC"
             ).fetchall()
         return [self._row_to_entry(r) for r in rows]
+
+    # ------------------------------------------------------------------ #
+    # 设置 API                                                            #
+    # ------------------------------------------------------------------ #
+
+    def get_setting(self, key: str) -> str | None:
+        """查询设置项，不存在返回 None。"""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (key,)
+            ).fetchone()
+        return row["value"] if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        """写入或更新设置项（UPSERT）。"""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO settings (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
+            )
 
     def get_all_ip_entries(self) -> list[Entry]:
         """返回全部 IP/CIDR 条目（type in ip/cidr），供 firewall.py 直接使用。"""

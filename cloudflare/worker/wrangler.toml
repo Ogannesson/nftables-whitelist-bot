@@ -1,0 +1,29 @@
+# Deploy to Cloudflare 一键部署配置
+# - KV namespace 由 Cloudflare Workers Builds 自动创建并替换下方 id
+# - Secrets 在部署向导中填写，见 .dev.vars.example
+# - 自定义域 + Access 应用在部署后于 Cloudflare Dashboard 另行配置
+
+name            = "tg-whitelist-gateway"
+main            = "src/index.js"
+compatibility_date = "2024-09-23"
+
+# 使用 workers.dev 子域（无需自定义域即可访问）
+# 自定义域部署后可在 Dashboard > Workers > Triggers > Custom Domains 添加
+workers_dev = true
+
+# Workers KV namespace — Deploy to Cloudflare 会自动创建并替换此 id
+[[kv_namespaces]]
+binding = "WHITELIST_KV"
+id      = "placeholder"
+# preview_id = "placeholder"  # 可选，供 wrangler dev 使用
+
+# 自定义域路由（可选，手动部署时取消注释并填写）
+# [[routes]]
+# pattern = "whitelist.example.com/*"
+# zone_name = "example.com"
+
+# Secrets 不在此处配置 — 通过 Workers Builds 向导或 wrangler secret put 设置：
+#   TEAM_DOMAIN        Cloudflare Access team 域名
+#   POLICY_AUD         Access 应用的 AUD tag
+#   PULL_CLIENT_ID     Service Token Client ID
+#   PULL_CLIENT_SECRET Service Token Client Secret
