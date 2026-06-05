@@ -167,7 +167,7 @@ Or with custom domain:
 直接在浏览器访问 `https://whitelist.example.com/`，应跳转到 Cloudflare Access 登录页。用允许的邮箱登录后，应看到注册页面：
 
 - **Cloudflare 看到你（可能为 IPv6）**：显示边缘看到的 `CF-Connecting-IP`（仅供对比/审计，不会被加白）；
-- **你的 IPv4 出口**：网页 JS 自动探测（`api4.ipify.org` → 兜底 `ipv4.icanhazip.com`）；
+- **你的 IPv4 出口**：网页 JS 自动探测（国内 `my.ip.cn` → 兜底 `api4.ipify.org`/`ipv4.icanhazip.com`）；
 - 点 **确认加入白名单** → 提交到 `POST /register` → 显示「已提交成功 + Registration ID」。
 
 > 若访问设备**没有 IPv4 出口**（纯 IPv6 网络），页面会提示「未检测到 IPv4 出口」并隐藏提交按钮——这是预期行为（白名单仅支持 v4）。
@@ -218,8 +218,8 @@ Cloudflare Worker（GET /）
     │  网页内嵌 CF-Connecting-IP（仅对比展示，可能是 v6）
     ▼
 用户浏览器内 JavaScript
-    │  ② fetch api4.ipify.org（v4-only）→ 探测真实 IPv4 出口
-    │     失败兜底 ipv4.icanhazip.com
+    │  ② fetch my.ip.cn（国内）→ 探测真实 IPv4 出口
+    │     失败兜底 api4.ipify.org / ipv4.icanhazip.com
     │  展示「CF 看到的 IP / 你的 v4 出口」，用户点「确认」
     ▼
 Cloudflare Worker（POST /register）

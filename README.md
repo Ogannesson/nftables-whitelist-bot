@@ -266,7 +266,7 @@ API key 通过 `config.toml`（`chmod 600`）或环境变量传入，不硬编�
 
 ## web auth 自动加白
 
-通过 Cloudflare Workers + Cloudflare Access 提供一个网页注册入口：访客通过 Access 认证后，**网页用 JavaScript 探测其真实的 IPv4 出口地址**（浏览器 fetch 公共 v4-only API），展示并由用户确认后提交；Worker 校验为合法公网 IPv4 后写入 KV，Bot 定时经 SOCKS5 pull 并自动永久加白。
+通过 Cloudflare Workers + Cloudflare Access 提供一个网页注册入口：访客通过 Access 认证后，**网页用 JavaScript 探测其真实的 IPv4 出口地址**（浏览器 fetch 公共 IP 接口：国内 `my.ip.cn` 优先，海外 `api4.ipify.org`/`ipv4.icanhazip.com` 兜底），展示并由用户确认后提交；Worker 校验为合法公网 IPv4 后写入 KV，Bot 定时经 SOCKS5 pull 并自动永久加白。
 
 > **为什么网页探测 v4 而非用 Cloudflare 回传的访问 IP？** nftables 白名单是 IPv4 only，但终端常 IPv6 优先，边缘 `CF-Connecting-IP` 往往是 v6（非企业版无法关闭 IPv6），直接用会写入永远加不进的 v6。代价：IP 改为客户端自报、可伪造，安全依赖 Access policy 只放本人邮箱——详见 [`docs/deploy/web-auth.md`](docs/deploy/web-auth.md) 的「安全模型」。
 

@@ -1,6 +1,6 @@
 # tg-whitelist Cloudflare Worker
 
-IP registration gateway. Users visit the protected URL through Cloudflare Access; the Worker returns an HTML page whose JavaScript detects the client's **real IPv4 egress** via a v4-only public API (`api4.ipify.org`, fallback `ipv4.icanhazip.com`). After the user confirms, the IPv4 is submitted to `POST /register`, validated as a public IPv4, and written to Workers KV. The server-side bot periodically pulls and ACKs.
+IP registration gateway. Users visit the protected URL through Cloudflare Access; the Worker returns an HTML page whose JavaScript detects the client's **real IPv4 egress** via a public IP API (`my.ip.cn` primary; `api4.ipify.org` / `ipv4.icanhazip.com` fallback). After the user confirms, the IPv4 is submitted to `POST /register`, validated as a public IPv4, and written to Workers KV. The server-side bot periodically pulls and ACKs.
 
 > Why client-side detection instead of `CF-Connecting-IP`? The nftables allowlist is IPv4-only, but most clients prefer IPv6, so Cloudflare's edge `CF-Connecting-IP` is often an IPv6 address (IPv6 can't be disabled on non-Enterprise plans). The trade-off: the IP becomes client-reported (forgeable) — security relies entirely on the Access policy being scoped to the owner's email only. See `docs/deploy/web-auth.md` → "安全模型".
 

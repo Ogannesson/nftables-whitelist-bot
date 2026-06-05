@@ -4,7 +4,7 @@
  * Routes:
  *   GET  /           — Cloudflare Access protected; verifies Cf-Access-Jwt-Assertion,
  *                      returns HTML page with embedded JS that detects client's IPv4
- *                      via api4.ipify.org (no KV write at this stage)
+ *                      via my.ip.cn (primary) / api4.ipify.org (fallback); no KV write here
  *   POST /register   — Cloudflare Access protected; receives client-reported IPv4,
  *                      validates it, writes to WHITELIST_KV under pending:<uuid>
  *   POST /pull       — Service-Token protected; returns all pending entries as JSON
@@ -160,32 +160,41 @@ async function handleIndex(request, env) {
       ' (' + ${JSON.stringify(countryEscaped)} + ')';
 
     // -----------------------------------------------------------------------
-    // Detect client's true IPv4 via v4-only DNS resolution APIs
+    // Detect client's true IPv4 via my.ip.cn (CN) with v4-only fallbacks
     // -----------------------------------------------------------------------
     let detectedV4 = null;
 
+    // Accept only a syntactically valid IPv4 string; reject IPv6 / junk so a
+    // dual-stack source returning a v6 address is skipped rather than misused.
+    function asV4(s) {
+      const ip = String(s == null ? '' : s).trim();
+      return /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip) ? ip : null;
+    }
+
     async function detectV4() {
-      // Primary: api4.ipify.org resolves to IPv4 only; returns {"ip":"x.x.x.x"}
-      try {
-        const res = await fetch('https://api4.ipify.org?format=json');
-        if (res.ok) {
-          const data = await res.json();
-          if (data && typeof data.ip === 'string' && data.ip.trim()) {
-            return data.ip.trim();
-          }
-        }
-      } catch (_) { /* fall through to backup */ }
+      // Try sources in order; first one yielding a valid IPv4 wins.
+      // Primary: my.ip.cn — domestic (CN), reachable without a proxy; returns
+      //   plain text like "ip：1.2.3.4 归属地：…" — extract the dotted-quad.
+      // Fallbacks: api4.ipify.org / ipv4.icanhazip.com — v4-only resolvers abroad.
+      const sources = [
+        async () => {
+          const t = await (await fetch('https://my.ip.cn/')).text();
+          const m = t.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/);
+          return m ? m[1] : null;
+        },
+        async () => {
+          const d = await (await fetch('https://api4.ipify.org?format=json')).json();
+          return d && d.ip;
+        },
+        async () => await (await fetch('https://ipv4.icanhazip.com')).text(),
+      ];
 
-      // Fallback: ipv4.icanhazip.com (plain text, CORS *)
-      try {
-        const res2 = await fetch('https://ipv4.icanhazip.com');
-        if (res2.ok) {
-          const text = await res2.text();
-          const ip = text.trim();
-          if (ip) return ip;
-        }
-      } catch (_) { /* fall through */ }
-
+      for (const get of sources) {
+        try {
+          const v4 = asV4(await get());
+          if (v4) return v4;
+        } catch (_) { /* try next source */ }
+      }
       return null;
     }
 

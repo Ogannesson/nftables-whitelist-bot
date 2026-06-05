@@ -518,7 +518,7 @@ ps aux | grep tgwl | grep -v grep
 1. 确认 `[cf_pull]` 已启用，`poll_interval_seconds` 建议临时改为 `30` 便于测试
 2. 用尚未加白的设备访问受 Cloudflare Access 保护的 Worker URL（`GET /`）
 3. 完成 Access 认证（policy 只放行本人邮箱）
-4. 页面应展示两行：**Cloudflare 看到你**（可能是 IPv6）/ **你的 IPv4 出口**（网页 JS 探测 `api4.ipify.org`）
+4. 页面应展示两行：**Cloudflare 看到你**（可能是 IPv6）/ **你的 IPv4 出口**（网页 JS 探测：国内 `my.ip.cn` → 兜底 `api4.ipify.org`/`ipv4.icanhazip.com`）
 5. 核对探测到的 v4 是你的真实出口，点「确认加入白名单」→ 页面显示「已提交成功 + Registration ID」
 6. 等待最多一个 poll 周期（30 秒）
 7. 在 Telegram 点「查看/管理」检查白名单列表
