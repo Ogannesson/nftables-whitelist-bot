@@ -143,8 +143,8 @@ async function handleIndex(request, env) {
     </div>
 
     <div class="row">
-      <span class="label">你的 IPv4 出口（探测中…）：</span><br/>
-      <code id="v4display">检测中...</code>
+      <span class="label">你的 IPv4 出口：</span><br/>
+      <code id="v4display">检测中…</code>
     </div>
 
     <div id="status"></div>
