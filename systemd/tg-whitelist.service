@@ -6,6 +6,10 @@ Wants=network-online.target
 # 依赖 nftables 已启动，但即使 nftables 未就绪 bot 也可 fail-open 启动
 Requires=
 
+# 崩溃重启的频率上限（StartLimit* 属于 [Unit] 段）：60s 窗口内最多重启 5 次
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=tgwl
@@ -19,11 +23,9 @@ WorkingDirectory=/opt/tg-whitelist
 
 ExecStart=/opt/tg-whitelist/.venv/bin/python -m tgwl.bot --config /opt/tg-whitelist/config.toml
 
-# 进程崩溃后自动重启（最多 5 次，每次间隔 10s）
+# 进程崩溃后自动重启，每次间隔 10s（重启频率上限见 [Unit] 段的 StartLimit*）
 Restart=on-failure
 RestartSec=10
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 # -------- 能力配置（非 root 运行 nftables）--------
 # 仅授予操作 nftables 所需的 CAP_NET_ADMIN
